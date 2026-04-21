@@ -1,0 +1,102 @@
+# ============================================================================
+# Funding Arbitrage Bot - .gitignore
+# ============================================================================
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.env
+.venv
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+logs/
+*.log
+*.log.*
+!logs/.gitkeep
+
+config.local.yaml
+config.prod.yaml
+*_local.yaml
+*_prod.yaml
+
+*.db
+*.sqlite
+*.sqlite3
+
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+*.csv
+*.json
+!logs/trades.json.example
+
+whitelist.txt
+!whitelist.txt.example
+
+trades.json
+
+# === CCXT ===
+.ccxt/
+.ccxt_cache/
+
+# === Docker ===
+.dockerignore
+Dockerfile
+docker-compose.yml
+.docker/
+
+# === IDE ===
+.vscode/
+.idea/
+*.iml
+.project
+.pydevproject
+.settings/
+
+# === Jupyter Notebook ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === mypy ===
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# === pytest ===
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+*.old
+*.bak
+*.backup

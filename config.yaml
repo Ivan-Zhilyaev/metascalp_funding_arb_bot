@@ -1,0 +1,120 @@
+active_exchanges:
+- binance
+- bitget
+- bybit
+- gate
+- kucoin
+- mexc
+- okx
+balance_update_interval: 30
+base_order_amount: 100
+check_trading_status: true
+dashboard_host: 127.0.0.1
+dashboard_port: 8000
+deduct_fees_from_profit: true
+enabled_exchanges:
+- binance
+- bitget
+- bybit
+- gate
+- kucoin
+- mexc
+- okx
+exchange_pairs:
+- perp: binance
+  spot: binance
+- perp: bybit
+  spot: bybit
+- perp: bybit
+  spot: binance
+- perp: binance
+  spot: bybit
+- perp: kucoin
+  spot: gate
+- perp: bybit
+  spot: okx
+- perp: bitget
+  spot: bybit
+- perp: bybit
+  spot: gate
+- perp: mexc
+  spot: gate
+- perp: gate
+  spot: bitget
+- perp: bitget
+  spot: okx
+- perp: mexc
+  spot: bitget
+- perp: bitget
+  spot: binance
+- perp: mexc
+  spot: bybit
+- perp: gate
+  spot: okx
+- perp: binance
+  spot: okx
+- perp: binance
+  spot: gate
+- perp: mexc
+  spot: binance
+- perp: binance
+  spot: bitget
+- perp: okx
+  spot: bitget
+- perp: kucoin
+  spot: bitget
+- perp: okx
+  spot: binance
+- perp: gate
+  spot: bybit
+- perp: kucoin
+  spot: binance
+- perp: kucoin
+  spot: okx
+- perp: gate
+  spot: binance
+- perp: bitget
+  spot: gate
+- perp: mexc
+  spot: okx
+- perp: gate
+  spot: gate
+- perp: bitget
+  spot: bitget
+- perp: bybit
+  spot: bitget
+- perp: okx
+  spot: okx
+- perp: okx
+  spot: bybit
+- perp: okx
+  spot: gate
+- perp: kucoin
+  spot: bybit
+funding_rate_threshold: 0.0001
+in_flight_state_tolerance: 60
+leverage: 3
+log_file: logs/bot.log
+manual_futures_fee_pct: 0.05
+manual_spot_fee_pct: 0.1
+margin_enabled: false
+max_concurrent_positions: 5
+max_current_opportunities: 5
+max_position_age_hours: 24
+max_recent_opportunities: 5
+max_slippage_pct: 1
+max_time_to_funding_minutes: 0
+metascalp_connection_check_interval: 60
+metascalp_max_reconnect_attempts: 10
+metascalp_reconnect_timeout: 30
+min_profit_bps: 10
+min_volume_24h_usdt: 10000
+next_arbitrage_opening_delay: 10
+opened_state_tolerance: 7200
+scan_interval: 5
+signal_log_file: logs/signal.log
+slippage_bps: 15
+test_mode: true
+trades_file: logs/trades.json
+version: 1.5.0
+whitelist_file: whitelist.txt
