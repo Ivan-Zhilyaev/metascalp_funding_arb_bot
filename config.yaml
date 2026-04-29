@@ -1,9 +1,13 @@
 active_exchanges:
 - binance
 - bitget
+- bitmart
 - bybit
 - gate
+- hyperliquid
 - kucoin
+- lbank
+- lighter
 - mexc
 - okx
 balance_update_interval: 30
@@ -13,13 +17,20 @@ dashboard_host: 127.0.0.1
 dashboard_port: 8000
 deduct_fees_from_profit: true
 enabled_exchanges:
+- asterdex
 - binance
 - bitget
+- bitmart
 - bybit
 - gate
+- hyperliquid
 - kucoin
+- lbank
+- lighter
 - mexc
 - okx
+- weex
+- xt
 exchange_pairs:
 - perp: binance
   spot: binance
@@ -30,67 +41,247 @@ exchange_pairs:
 - perp: binance
   spot: bybit
 - perp: kucoin
-  spot: gate
-- perp: bybit
-  spot: okx
-- perp: bitget
-  spot: bybit
-- perp: bybit
-  spot: gate
-- perp: mexc
-  spot: gate
-- perp: gate
   spot: bitget
-- perp: bitget
-  spot: okx
-- perp: mexc
-  spot: bitget
-- perp: bitget
-  spot: binance
-- perp: mexc
-  spot: bybit
-- perp: gate
-  spot: okx
-- perp: binance
-  spot: okx
 - perp: binance
   spot: gate
 - perp: mexc
+  spot: okx
+- perp: bitget
   spot: binance
+- perp: okx
+  spot: bybit
+- perp: gate
+  spot: gate
 - perp: binance
   spot: bitget
-- perp: okx
+- perp: bybit
+  spot: okx
+- perp: bitget
+  spot: gate
+- perp: bitget
   spot: bitget
 - perp: kucoin
-  spot: bitget
+  spot: okx
 - perp: okx
-  spot: binance
+  spot: okx
 - perp: gate
+  spot: okx
+- perp: kucoin
+  spot: binance
+- perp: okx
+  spot: gate
+- perp: kucoin
   spot: bybit
-- perp: kucoin
-  spot: binance
-- perp: kucoin
-  spot: okx
-- perp: gate
-  spot: binance
-- perp: bitget
-  spot: gate
-- perp: mexc
-  spot: okx
-- perp: gate
-  spot: gate
-- perp: bitget
-  spot: bitget
 - perp: bybit
   spot: bitget
 - perp: okx
+  spot: bitget
+- perp: bitget
   spot: okx
-- perp: okx
+- perp: bitget
   spot: bybit
-- perp: okx
+- perp: gate
+  spot: bitget
+- perp: binance
+  spot: okx
+- perp: mexc
   spot: gate
 - perp: kucoin
+  spot: gate
+- perp: bybit
+  spot: gate
+- perp: gate
+  spot: binance
+- perp: mexc
+  spot: binance
+- perp: mexc
+  spot: bitget
+- perp: gate
   spot: bybit
+- perp: mexc
+  spot: bybit
+- perp: okx
+  spot: binance
+- perp: okx
+  spot: hyperliquid
+- perp: hyperliquid
+  spot: gate
+- perp: bitmart
+  spot: lighter
+- perp: bitget
+  spot: hyperliquid
+- perp: asterdex
+  spot: bitmart
+- perp: mexc
+  spot: bitmart
+- perp: asterdex
+  spot: okx
+- perp: mexc
+  spot: lighter
+- perp: bybit
+  spot: lbank
+- perp: gate
+  spot: bitmart
+- perp: bitmart
+  spot: lbank
+- perp: kucoin
+  spot: lighter
+- perp: hyperliquid
+  spot: okx
+- perp: bitget
+  spot: bitmart
+- perp: lighter
+  spot: binance
+- perp: lighter
+  spot: mexc
+- perp: bitmart
+  spot: mexc
+- perp: hyperliquid
+  spot: lbank
+- perp: binance
+  spot: mexc
+- perp: asterdex
+  spot: mexc
+- perp: asterdex
+  spot: lbank
+- perp: binance
+  spot: hyperliquid
+- perp: okx
+  spot: asterdex
+- perp: bitmart
+  spot: hyperliquid
+- perp: lighter
+  spot: asterdex
+- perp: bitget
+  spot: lighter
+- perp: hyperliquid
+  spot: bitget
+- perp: bitget
+  spot: lbank
+- perp: gate
+  spot: mexc
+- perp: bitmart
+  spot: bybit
+- perp: lighter
+  spot: gate
+- perp: bybit
+  spot: asterdex
+- perp: hyperliquid
+  spot: asterdex
+- perp: kucoin
+  spot: hyperliquid
+- perp: asterdex
+  spot: asterdex
+- perp: okx
+  spot: lighter
+- perp: bitget
+  spot: mexc
+- perp: kucoin
+  spot: lbank
+- perp: gate
+  spot: hyperliquid
+- perp: bitmart
+  spot: okx
+- perp: lighter
+  spot: bitmart
+- perp: kucoin
+  spot: mexc
+- perp: binance
+  spot: lbank
+- perp: bitget
+  spot: asterdex
+- perp: hyperliquid
+  spot: hyperliquid
+- perp: mexc
+  spot: asterdex
+- perp: okx
+  spot: lbank
+- perp: mexc
+  spot: mexc
+- perp: asterdex
+  spot: gate
+- perp: gate
+  spot: asterdex
+- perp: bitmart
+  spot: gate
+- perp: bitmart
+  spot: asterdex
+- perp: asterdex
+  spot: bybit
+- perp: bybit
+  spot: bitmart
+- perp: hyperliquid
+  spot: lighter
+- perp: binance
+  spot: asterdex
+- perp: kucoin
+  spot: asterdex
+- perp: gate
+  spot: lbank
+- perp: hyperliquid
+  spot: bybit
+- perp: hyperliquid
+  spot: bitmart
+- perp: lighter
+  spot: bitget
+- perp: lighter
+  spot: hyperliquid
+- perp: asterdex
+  spot: lighter
+- perp: kucoin
+  spot: bitmart
+- perp: asterdex
+  spot: binance
+- perp: bybit
+  spot: hyperliquid
+- perp: lighter
+  spot: bybit
+- perp: hyperliquid
+  spot: binance
+- perp: hyperliquid
+  spot: mexc
+- perp: okx
+  spot: bitmart
+- perp: asterdex
+  spot: hyperliquid
+- perp: gate
+  spot: lighter
+- perp: binance
+  spot: bitmart
+- perp: lighter
+  spot: okx
+- perp: mexc
+  spot: lbank
+- perp: bitmart
+  spot: binance
+- perp: lighter
+  spot: lbank
+- perp: binance
+  spot: lighter
+- perp: bitmart
+  spot: bitget
+- perp: lighter
+  spot: lighter
+- perp: bitmart
+  spot: bitmart
+- perp: okx
+  spot: mexc
+- perp: bybit
+  spot: mexc
+- perp: mexc
+  spot: hyperliquid
+- perp: asterdex
+  spot: bitget
+- perp: bybit
+  spot: lighter
+fallback_priority:
+- binance
+- bybit
+- gate
+- kucoin
+- mexc
+- okx
+- bitget
 funding_rate_threshold: 0.0001
 in_flight_state_tolerance: 60
 leverage: 3
@@ -103,18 +294,19 @@ max_current_opportunities: 5
 max_position_age_hours: 24
 max_recent_opportunities: 5
 max_slippage_pct: 1
-max_time_to_funding_minutes: 0
 metascalp_connection_check_interval: 60
 metascalp_max_reconnect_attempts: 10
 metascalp_reconnect_timeout: 30
 min_profit_bps: 10
+min_time_to_funding_minutes: 0
 min_volume_24h_usdt: 10000
 next_arbitrage_opening_delay: 10
+open_positions_file: logs/open_positions.json
 opened_state_tolerance: 7200
-scan_interval: 5
+scan_interval: 1
 signal_log_file: logs/signal.log
 slippage_bps: 15
 test_mode: true
 trades_file: logs/trades.json
-version: 1.5.0
+version: 1.6.2
 whitelist_file: whitelist.txt

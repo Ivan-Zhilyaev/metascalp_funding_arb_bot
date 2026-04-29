@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Funding Rate Arbitrage Scanner + Executor for MetaScalp
-Version: 1.5.0
+Version: 1.6.2
 """
 
 import os
@@ -17,6 +17,7 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 from collections import deque
 from logging.handlers import RotatingFileHandler
+from contextlib import asynccontextmanager
 
 import yaml
 import aiohttp
@@ -30,7 +31,7 @@ import uvicorn
 # Версия
 # ============================================================================
 
-__version__ = "1.5.0"
+__version__ = "1.6.2"
 BOT_NAME = "Funding Arbitrage Bot"
 
 
@@ -237,7 +238,7 @@ class FundingArbitrageBot:
         self.max_current_opportunities = self.config.get('max_current_opportunities', 5)
 
         # === Фильтры ===
-        self.max_time_to_funding_minutes = self.config.get('max_time_to_funding_minutes', 0)
+        self.min_time_to_funding_minutes = self.config.get('min_time_to_funding_minutes', 0)
         self.check_trading_status = self.config.get('check_trading_status', True)
         self.deduct_fees_from_profit = self.config.get('deduct_fees_from_profit', True)
         self.manual_spot_fee_pct = self.config.get('manual_spot_fee_pct', 0.1)
@@ -253,6 +254,9 @@ class FundingArbitrageBot:
         self.last_scan_time: float = 0
         self.trades_history: List[TradeRecord] = []
         self._load_trades_history()
+
+        # === Файл открытых позиций ===
+        self.open_positions_file = self.config.get('open_positions_file', 'logs/open_positions.json')
 
         # === Статистика ===
         self.scan_count = 0
@@ -284,10 +288,11 @@ class FundingArbitrageBot:
         defaults = {
             'active_exchanges': [], 'margin_enabled': False, 'min_volume_24h_usdt': 10000,
             'max_slippage_pct': 1.0, 'max_recent_opportunities': 5, 'max_current_opportunities': 5,
-            'max_time_to_funding_minutes': 0, 'check_trading_status': True,
+            'min_time_to_funding_minutes': 0, 'check_trading_status': True,
             'deduct_fees_from_profit': True, 'manual_spot_fee_pct': 0.1, 'manual_futures_fee_pct': 0.05,
             'balance_update_interval': 30, 'max_concurrent_positions': 1,
-            'signal_log_file': 'logs/signal.log'
+            'signal_log_file': 'logs/signal.log', 'open_positions_file': 'logs/open_positions.json',
+            'fallback_priority': ['binance', 'bybit', 'gate', 'kucoin', 'mexc', 'okx', 'bitget']
         }
         for key, value in defaults.items():
             if key not in config:
@@ -328,7 +333,7 @@ class FundingArbitrageBot:
         self.signal_logger.setLevel(logging.INFO)
         signal_handler = RotatingFileHandler(
             signal_log_file,
-            maxBytes=10 * 1024 * 1024,  # 10 МБ
+            maxBytes=10 * 1024 * 1024,
             backupCount=5,
             encoding='utf-8'
         )
@@ -371,6 +376,87 @@ class FundingArbitrageBot:
         self.total_pnl += trade.pnl
         self._save_trades_history()
 
+    # ========================================================================
+    # Персистентность открытых позиций
+    # ========================================================================
+
+    def _load_open_positions(self) -> None:
+        """Загрузка открытых позиций из файла"""
+        try:
+            path = Path(self.open_positions_file)
+            if path.exists():
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                    for p in data:
+                        pos = Position(**p)
+                        self.positions.append(pos)
+                self.logger.info(f"📂 Загружено {len(self.positions)} открытых позиций из файла")
+            else:
+                self.logger.info("📂 Файл открытых позиций не найден, начинаем с пустого списка")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка загрузки открытых позиций: {e}")
+
+    def _save_open_positions(self) -> None:
+        """Сохранение открытых позиций в файл"""
+        try:
+            path = Path(self.open_positions_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            active = [asdict(p) for p in self.active_positions]
+            with open(path, 'w') as f:
+                json.dump(active, f, indent=2)
+            self.logger.debug(f"💾 Сохранено {len(active)} открытых позиций")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка сохранения открытых позиций: {e}")
+
+    async def _check_perp_position_exists(self, pos: Position) -> bool:
+        """Проверяет, существует ли фьючерсная позиция на бирже через MetaScalp API"""
+        if pos.perp_exchange not in self.metascalp_connections:
+            return False
+        
+        perp_conn_id = self.metascalp_connections[pos.perp_exchange].get('perp_id')
+        if not perp_conn_id:
+            return False
+
+        try:
+            async with self.metascalp_session.get(
+                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{perp_conn_id}/positions"
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+                clean_symbol = pos.symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
+                
+                for real_pos in data.get('Positions', []):
+                    if real_pos.get('Ticker') == clean_symbol:
+                        if pos.direction == 'BUY_SPOT_SHORT_PERP' and real_pos.get('Side') == 2:
+                            return True
+                        elif pos.direction == 'SELL_SPOT_LONG_PERP' and real_pos.get('Side') == 1:
+                            return True
+                return False
+        except Exception as e:
+            self.logger.debug(f"Ошибка проверки позиции {pos.symbol}: {e}")
+            return False
+
+    async def _sync_positions_with_exchange(self) -> None:
+        """Синхронизация позиций из файла с реальными на бирже (только для реальной торговли)"""
+        if self.is_test_mode:
+            self.logger.info(f"🧪 Тестовый режим: {len(self.positions)} позиций загружено из файла")
+            return
+
+        self.logger.info("🔄 Синхронизация позиций с биржей...")
+        valid_positions = []
+        
+        for pos in self.positions:
+            if await self._check_perp_position_exists(pos):
+                valid_positions.append(pos)
+                self.logger.info(f"   ✅ Позиция {pos.symbol} на {pos.perp_exchange} подтверждена")
+            else:
+                self.logger.warning(f"   ❌ Позиция {pos.symbol} на {pos.perp_exchange} не найдена на бирже, удалена")
+        
+        self.positions = valid_positions
+        self._save_open_positions()
+        self.logger.info(f"✅ Синхронизация завершена, осталось {len(self.positions)} позиций")
+
     def _log_startup_info(self) -> None:
         self.logger.info("=" * 70)
         self.logger.info(f"🤖 {BOT_NAME} v{__version__}")
@@ -383,6 +469,7 @@ class FundingArbitrageBot:
         self.logger.info(f"⚡ Плечо (фьючерсы): {self.leverage}x")
         self.logger.info(f"📈 Маржинальная торговля (спот): {'ВКЛЮЧЕНА' if self.margin_enabled else 'ВЫКЛЮЧЕНА'}")
         self.logger.info(f"🔢 Макс. одновременных сделок: {self.max_concurrent_positions}")
+        self.logger.info(f"⏰ Мин. время до выплаты: {self.min_time_to_funding_minutes} мин")
         self.logger.info("=" * 70)
 
     # ========================================================================
@@ -422,12 +509,19 @@ class FundingArbitrageBot:
         return len(self.active_positions) < self.max_concurrent_positions
 
     def is_position_already_open(self, symbol: str, spot_ex: str, perp_ex: str) -> bool:
+        """Проверяет, открыта ли уже ТОЧНО ТАКАЯ ЖЕ позиция (символ + спот + перп)"""
         for p in self.active_positions:
             if p.symbol == symbol and p.spot_exchange == spot_ex and p.perp_exchange == perp_ex:
                 return True
-            if p.symbol == symbol and (p.spot_exchange == spot_ex or p.perp_exchange == perp_ex):
-                return True
         return False
+
+    def find_position_by_id(self, position_id: str) -> Optional[Position]:
+        """Находит позицию по уникальному идентификатору"""
+        for pos in self.active_positions:
+            pos_id = f"{pos.symbol}_{pos.spot_exchange}_{pos.perp_exchange}_{pos.entry_time}"
+            if pos_id == position_id:
+                return pos
+        return None
 
     # ========================================================================
     # Синхронизация с MetaScalp
@@ -450,8 +544,11 @@ class FundingArbitrageBot:
         if not self.metascalp_connections:
             return
 
-        spot_exchanges = [ex for ex, conns in self.metascalp_connections.items() if 'spot_id' in conns]
-        perp_exchanges = [ex for ex, conns in self.metascalp_connections.items() if 'perp_id' in conns]
+        active_exchanges = set(self.config.get('active_exchanges', []))
+        spot_exchanges = [ex for ex, conns in self.metascalp_connections.items() 
+                         if 'spot_id' in conns and ex in active_exchanges]
+        perp_exchanges = [ex for ex, conns in self.metascalp_connections.items() 
+                         if 'perp_id' in conns and ex in active_exchanges]
 
         if not spot_exchanges or not perp_exchanges:
             return
@@ -522,6 +619,8 @@ class FundingArbitrageBot:
     # ========================================================================
 
     def update_config(self, updates: Dict[str, Any]) -> None:
+        old_deduct_fees = self.config.get('deduct_fees_from_profit', True)
+        
         for key, value in updates.items():
             if key in self.config:
                 self.config[key] = value
@@ -535,13 +634,18 @@ class FundingArbitrageBot:
         self.margin_enabled = self.config.get('margin_enabled', False)
         self.min_volume_24h_usdt = self.config.get('min_volume_24h_usdt', 10000)
         self.max_slippage_pct = self.config.get('max_slippage_pct', 1.0)
-        self.max_time_to_funding_minutes = self.config.get('max_time_to_funding_minutes', 0)
+        self.min_time_to_funding_minutes = self.config.get('min_time_to_funding_minutes', 0)
         self.check_trading_status = self.config.get('check_trading_status', True)
         self.deduct_fees_from_profit = self.config.get('deduct_fees_from_profit', True)
         self.manual_spot_fee_pct = self.config.get('manual_spot_fee_pct', 0.1)
         self.manual_futures_fee_pct = self.config.get('manual_futures_fee_pct', 0.05)
         self.balance_update_interval = self.config.get('balance_update_interval', 30)
         self.max_concurrent_positions = self.config.get('max_concurrent_positions', 1)
+
+        if old_deduct_fees and not self.deduct_fees_from_profit:
+            self.spot_fees_cache.clear()
+            self.futures_fees_cache.clear()
+            self.logger.info("🧹 Кэш комиссий очищен")
 
         if self.manual_test_mode:
             self.auto_test_mode = False
@@ -561,20 +665,38 @@ class FundingArbitrageBot:
         self.config['active_exchanges'] = valid_exchanges
         self._save_config()
         self.logger.info(f"📝 Активные биржи обновлены: {', '.join(valid_exchanges)}")
+        self._sync_exchange_pairs_from_metascalp()
 
     def get_status(self) -> dict:
         active_positions = self.active_positions
         first_position = active_positions[0] if active_positions else None
         
-        next_funding_str = None
-        if first_position and first_position.next_funding_time:
-            time_to_funding = first_position.next_funding_time - self.current_timestamp
-            if time_to_funding > 0:
-                hours = int(time_to_funding // 3600)
-                minutes = int((time_to_funding % 3600) // 60)
-                next_funding_str = f"{hours}ч {minutes}м"
+        positions_with_id = []
+        for p in active_positions:
+            p_dict = asdict(p)
+            p_dict['position_id'] = f"{p.symbol}_{p.spot_exchange}_{p.perp_exchange}_{p.entry_time}"
+            
+            if p.next_funding_time:
+                time_to_funding = p.next_funding_time - self.current_timestamp
+                if time_to_funding > 0:
+                    hours = int(time_to_funding // 3600)
+                    minutes = int((time_to_funding % 3600) // 60)
+                    p_dict['funding_time_str'] = f"{hours}ч {minutes}м"
+                else:
+                    p_dict['funding_time_str'] = "выплата идёт"
             else:
-                next_funding_str = "выплата идёт"
+                p_dict['funding_time_str'] = "—"
+            
+            positions_with_id.append(p_dict)
+        
+        next_funding_str = positions_with_id[0]['funding_time_str'] if positions_with_id else None
+
+        current_rates = {}
+        for pos in active_positions:
+            rate = self._last_current_rates.get(pos.symbol)
+            self.logger.debug(f"📊 get_status: {pos.symbol} -> {rate}")
+            if rate is not None:
+                current_rates[pos.symbol] = rate
 
         return {
             'version': __version__,
@@ -589,10 +711,11 @@ class FundingArbitrageBot:
             'metascalp_port': self.metascalp_port,
             'metascalp_connections': self.metascalp_connections,
             'metascalp_balances': self.metascalp_balances,
-            'positions': [asdict(p) for p in active_positions],
+            'positions': positions_with_id,
             'position': asdict(first_position) if first_position else None,
             'active_positions_count': len(active_positions),
-            'current_funding_rate': self._last_current_rates.get(first_position.symbol, None) if first_position else None,
+            'current_funding_rate': current_rates.get(first_position.symbol) if first_position else None,
+            'current_funding_rates': current_rates,
             'next_funding_time_str': next_funding_str,
             'scan_count': self.scan_count,
             'opportunities_found': self.opportunities_found,
@@ -620,7 +743,7 @@ class FundingArbitrageBot:
                 'max_slippage_pct': self.max_slippage_pct,
                 'max_recent_opportunities': self.max_recent_opportunities,
                 'max_current_opportunities': self.max_current_opportunities,
-                'max_time_to_funding_minutes': self.max_time_to_funding_minutes,
+                'min_time_to_funding_minutes': self.min_time_to_funding_minutes,
                 'check_trading_status': self.check_trading_status,
                 'deduct_fees_from_profit': self.deduct_fees_from_profit,
                 'manual_spot_fee_pct': self.manual_spot_fee_pct,
@@ -638,6 +761,21 @@ class FundingArbitrageBot:
     async def initialize(self) -> None:
         await self._init_exchanges()
         await self._connect_metascalp()
+        self._load_open_positions()
+        await self._sync_positions_with_exchange()
+        
+        # Запрашиваем актуальные ставки для всех загруженных позиций
+        self.logger.info(f"🔄 Загрузка актуальных ставок для {len(self.positions)} позиций...")
+        for pos in self.positions:
+            if not pos.close_time:
+                self.logger.info(f"   Запрос ставки для {pos.symbol} на {pos.perp_exchange}...")
+                result = await self._fetch_funding_rate(pos.perp_exchange, pos.symbol)
+                if result:
+                    current_rate, _ = result
+                    self._last_current_rates[pos.symbol] = current_rate
+                    self.logger.info(f"   ✅ Ставка для {pos.symbol}: {current_rate*100:.4f}%")
+                else:
+                    self.logger.warning(f"   ❌ Не удалось получить ставку для {pos.symbol}")
 
     async def _connect_metascalp(self) -> bool:
         self.metascalp_state = ConnectionState.CONNECTING
@@ -805,25 +943,42 @@ class FundingArbitrageBot:
                 self.metascalp_reconnect_attempts = 0
 
     async def _init_exchanges(self) -> None:
+        """Инициализация ТОЛЬКО активных бирж CCXT с повторными попытками при ошибках"""
+        active_exchanges = set(self.config.get('active_exchanges', []))
+        
         for ex_name in self.config['enabled_exchanges']:
-            try:
-                exchange_class = getattr(ccxt, ex_name)
-                exchange = exchange_class({
-                    'enableRateLimit': True,
-                    'options': {'defaultType': 'future' if ex_name == 'binance' else 'swap'}
-                })
-                await exchange.load_markets()
-                self.exchanges[ex_name] = exchange
-                self.exchanges_online[ex_name] = True
-                self.logger.info(f"✅ Биржа {ex_name.upper()} инициализирована")
-            except Exception as e:
-                self.exchanges_online[ex_name] = False
-                self.logger.error(f"❌ Ошибка инициализации {ex_name}: {e}")
-                if ex_name in self.exchanges:
-                    try:
-                        await self.exchanges[ex_name].close()
-                    except:
-                        pass
+            if ex_name not in active_exchanges:
+                self.logger.debug(f"⏭️ Биржа {ex_name} не активна, пропускаем инициализацию")
+                continue
+                
+            success = False
+            for attempt in range(3):
+                try:
+                    exchange_class = getattr(ccxt, ex_name)
+                    exchange = exchange_class({
+                        'enableRateLimit': True,
+                        'timeout': 30000,
+                        'options': {'defaultType': 'future' if ex_name == 'binance' else 'swap'}
+                    })
+                    await exchange.load_markets()
+                    self.exchanges[ex_name] = exchange
+                    self.exchanges_online[ex_name] = True
+                    self.logger.info(f"✅ Биржа {ex_name.upper()} инициализирована")
+                    success = True
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        self.logger.warning(f"⚠️ Попытка {attempt + 1} для {ex_name} не удалась, повтор через 5 сек...")
+                        await asyncio.sleep(5)
+                    else:
+                        self.exchanges_online[ex_name] = False
+                        self.logger.error(f"❌ Ошибка инициализации {ex_name}: {e}")
+                    if ex_name in self.exchanges:
+                        try:
+                            await self.exchanges[ex_name].close()
+                            del self.exchanges[ex_name]
+                        except:
+                            pass
 
     async def _check_exchanges_online(self) -> None:
         for ex_name, exchange in self.exchanges.items():
@@ -836,6 +991,8 @@ class FundingArbitrageBot:
     async def shutdown(self) -> None:
         self.logger.info("🛑 Завершение работы бота...")
         self.is_running = False
+        
+        self._save_open_positions()
 
         for ex in self.exchanges.values():
             await ex.close()
@@ -880,24 +1037,60 @@ class FundingArbitrageBot:
 
     async def _get_fallback_symbols(self) -> Set[str]:
         symbols = set()
-        active = self.config.get('active_exchanges', [])
-
+        active = set(self.config.get('active_exchanges', []))
+        
         if len(active) < 1:
+            self.logger.warning("⚠️ Fallback: нет активных бирж в конфиге")
             return symbols
 
-        first_ex = active[0]
-        if first_ex in self.exchanges:
-            for symbol, market in self.exchanges[first_ex].markets.items():
+        fallback_priority = self.config.get('fallback_priority', [])
+        
+        selected_ex = None
+        
+        for ex in fallback_priority:
+            if ex in active and ex in self.exchanges:
+                if hasattr(self.exchanges[ex], 'markets') and self.exchanges[ex].markets:
+                    selected_ex = ex
+                    self.logger.debug(f"📋 Fallback: выбрана приоритетная биржа {ex}")
+                    break
+        
+        if not selected_ex:
+            for ex in active:
+                if ex in self.exchanges:
+                    if hasattr(self.exchanges[ex], 'markets') and self.exchanges[ex].markets:
+                        selected_ex = ex
+                        self.logger.debug(f"📋 Fallback: приоритетные биржи недоступны, выбрана {ex}")
+                        break
+        
+        if not selected_ex:
+            self.logger.warning("⚠️ Fallback: нет доступных бирж с загруженными рынками")
+            self.logger.info(f"   Активные биржи: {list(active)}")
+            self.logger.info(f"   Инициализированные: {list(self.exchanges.keys())}")
+            return symbols
+
+        try:
+            count = 0
+            for symbol, market in self.exchanges[selected_ex].markets.items():
                 if symbol.endswith('/USDT') and market.get('active', False):
                     base = symbol.split('/')[0]
                     symbols.add(base)
-
-        full_symbols = {f"{s}/USDT:USDT" for s in symbols}
-        if self.scan_count % 60 == 0:
-            self.logger.info(f"📋 Fallback: найдено {len(full_symbols)} общих инструментов")
-        else:
-            self.logger.debug(f"📋 Fallback: найдено {len(full_symbols)} общих инструментов")
-        return full_symbols
+                    count += 1
+            
+            full_symbols = {f"{s}/USDT:USDT" for s in symbols}
+            
+            if self.scan_count % 10 == 0 or self.scan_count == 1:
+                self.logger.info(f"📋 Fallback: биржа {selected_ex} → {len(full_symbols)} инструментов")
+            else:
+                self.logger.debug(f"📋 Fallback: биржа {selected_ex} → {len(full_symbols)} инструментов")
+            
+            if len(full_symbols) == 0:
+                self.logger.warning(f"⚠️ Fallback: биржа {selected_ex} не вернула ни одной активной USDT-пары!")
+                
+            return full_symbols
+            
+        except Exception as e:
+            self.logger.error(f"❌ Fallback: ошибка получения рынков с {selected_ex}: {e}")
+            return symbols
 
     # ========================================================================
     # Комиссии и ликвидность
@@ -1008,7 +1201,7 @@ class FundingArbitrageBot:
         if not passes:
             return None
 
-        if self.check_trading_status:
+        if self.config.get('check_trading_status', True):
             try:
                 perp_market = self.exchanges[perp_ex].market(symbol)
                 spot_market = self.exchanges[spot_ex].market(symbol.replace(':USDT', ''))
@@ -1024,13 +1217,15 @@ class FundingArbitrageBot:
 
         funding_rate, next_funding_time = result
 
-        if abs(funding_rate) < self.funding_rate_threshold:
+        if abs(funding_rate) < self.config.get('funding_rate_threshold', 0.0001):
             return None
 
-        if self.max_time_to_funding_minutes > 0 and next_funding_time:
+        min_time = self.config.get('min_time_to_funding_minutes', 0)
+        if min_time > 0 and next_funding_time:
             time_to_funding = next_funding_time - time.time()
-            if time_to_funding > self.max_time_to_funding_minutes * 60:
+            if time_to_funding < min_time * 60:
                 self.filtered_by_time += 1
+                self.logger.debug(f"⏰ {symbol} отфильтрован: до выплаты {time_to_funding/60:.0f} мин < {min_time} мин")
                 return None
 
         if funding_rate > 0:
@@ -1040,7 +1235,7 @@ class FundingArbitrageBot:
             expected_profit_bps = abs(funding_rate) * 10000
             direction = "SHORT_SPOT_LONG_PERP"
 
-        if direction == "SHORT_SPOT_LONG_PERP" and not self.margin_enabled:
+        if direction == "SHORT_SPOT_LONG_PERP" and not self.config.get('margin_enabled', False):
             self.filtered_by_margin += 1
             return None
 
@@ -1048,7 +1243,7 @@ class FundingArbitrageBot:
         perp_fee_pct = 0.0
         net_profit_bps = expected_profit_bps
 
-        if self.deduct_fees_from_profit:
+        if self.config.get('deduct_fees_from_profit', True):
             spot_fee_rate = await self._get_trading_fees(spot_ex, symbol, is_spot=True)
             perp_fee_rate = await self._get_trading_fees(perp_ex, symbol, is_spot=False)
 
@@ -1058,7 +1253,8 @@ class FundingArbitrageBot:
                 total_fee_percent = (spot_fee_rate + perp_fee_rate) * 2 * 100
                 net_profit_bps = expected_profit_bps - (total_fee_percent * 100)
 
-                if net_profit_bps < self.min_profit_bps:
+                min_profit = self.config.get('min_profit_bps', 10)
+                if net_profit_bps < min_profit:
                     self.filtered_by_fees += 1
                     return None
 
@@ -1111,43 +1307,24 @@ class FundingArbitrageBot:
         return opportunities
 
     # ========================================================================
-    # Управление состоянием
-    # ========================================================================
-
-    def update_in_flight_state(self, pos: Position) -> None:
-        if not pos.close_time:
-            if not pos.spot_filled or not pos.perp_filled:
-                # Проверяем, исполнились ли ордера (в реальном режиме нужно опрашивать MetaScalp)
-                pass
-
-    def check_state_timeouts(self) -> None:
-        for pos in self.active_positions:
-            if not pos.spot_filled or not pos.perp_filled:
-                elapsed = self.current_timestamp - pos.entry_time
-                if elapsed > self.in_flight_state_tolerance:
-                    self.logger.warning(f"⚠️ Таймаут исполнения ордеров для {pos.symbol} ({self.in_flight_state_tolerance} сек)")
-
-    # ========================================================================
     # Условия входа и выхода
     # ========================================================================
 
     def should_buy_spot_short_perp(self, opp: ArbitrageOpportunity) -> bool:
-        is_profitable = opp.net_profit_bps >= self.min_profit_bps
+        is_profitable = opp.net_profit_bps >= self.config.get('min_profit_bps', 10)
         is_repeat = self.last_strategy_action == StrategyAction.BUY_SPOT_SHORT_PERP
         correct_direction = opp.funding_rate > 0
         return is_profitable and not is_repeat and correct_direction
 
     def should_sell_spot_long_perp(self, opp: ArbitrageOpportunity) -> bool:
-        if not self.margin_enabled:
+        if not self.config.get('margin_enabled', False):
             return False
-        is_profitable = opp.net_profit_bps >= self.min_profit_bps
+        is_profitable = opp.net_profit_bps >= self.config.get('min_profit_bps', 10)
         is_repeat = self.last_strategy_action == StrategyAction.SELL_SPOT_LONG_PERP
         correct_direction = opp.funding_rate < 0
         return is_profitable and not is_repeat and correct_direction
 
     async def can_buy_spot_short_perp(self, opp: ArbitrageOpportunity) -> bool:
-        """Проверка достаточности баланса для LONG SPOT + SHORT PERP"""
-        # В тестовом режиме всегда возвращаем True
         if self.is_test_mode:
             return True
 
@@ -1162,9 +1339,6 @@ class FundingArbitrageBot:
         perp_balance = self.metascalp_balances.get(perp_conn_id, 0)
 
         required = self.base_order_amount
-        
-        self.logger.debug(f"💰 Баланс {opp.spot_exchange}: {spot_balance:.2f} USDT, требуется: {required:.2f} USDT")
-        self.logger.debug(f"💰 Баланс {opp.perp_exchange}: {perp_balance:.2f} USDT, требуется: {required * 0.1:.2f} USDT")
         
         if spot_balance < required:
             self.logger.info(f"❌ Недостаточно баланса на споте {opp.spot_exchange}: {spot_balance:.2f} < {required:.2f} USDT")
@@ -1177,8 +1351,6 @@ class FundingArbitrageBot:
         return True
 
     async def can_sell_spot_long_perp(self, opp: ArbitrageOpportunity) -> bool:
-        """Проверка достаточности баланса для SHORT SPOT + LONG PERP"""
-        # В тестовом режиме всегда возвращаем True
         if self.is_test_mode:
             return True
 
@@ -1194,9 +1366,6 @@ class FundingArbitrageBot:
 
         required = self.base_order_amount
         
-        self.logger.debug(f"💰 Баланс {opp.spot_exchange}: {spot_balance:.2f} USDT, требуется: {required:.2f} USDT")
-        self.logger.debug(f"💰 Баланс {opp.perp_exchange}: {perp_balance:.2f} USDT, требуется: {required * 0.1:.2f} USDT")
-        
         if spot_balance < required:
             self.logger.info(f"❌ Недостаточно баланса на споте {opp.spot_exchange}: {spot_balance:.2f} < {required:.2f} USDT")
             return False
@@ -1207,17 +1376,8 @@ class FundingArbitrageBot:
         
         return True
 
-    async def should_close_position(self, pos: Position) -> Tuple[bool, Optional[ExitReason]]:
-        result = await self._fetch_funding_rate(pos.perp_exchange, pos.symbol)
-
-        if result is not None:
-            current_rate, _ = result
-            self._last_current_rates[pos.symbol] = current_rate
-
-        if result is None:
-            return False, None
-
-        current_rate, _ = result
+    async def _check_close_condition(self, pos: Position, current_rate: float) -> Tuple[bool, Optional[ExitReason]]:
+        """Проверка условия закрытия с уже известной ставкой"""
         entry_rate = pos.entry_funding_rate
         if (entry_rate > 0 and current_rate < 0) or (entry_rate < 0 and current_rate > 0):
             self.logger.info(f"🔄 Ставка сменила знак для {pos.symbol}: {entry_rate*100:.4f}% → {current_rate*100:.4f}%")
@@ -1352,6 +1512,7 @@ class FundingArbitrageBot:
                 leverage=self.leverage
             )
             self.positions.append(pos)
+            self._save_open_positions()
             self._last_current_rates[opp.symbol] = opp.funding_rate
             self.last_strategy_action = StrategyAction.BUY_SPOT_SHORT_PERP
             self.logger.info(f"🧪 [ТЕСТ] Позиция симулирована (всего открыто: {len(self.active_positions)})")
@@ -1401,6 +1562,7 @@ class FundingArbitrageBot:
                     leverage=self.leverage
                 )
                 self.positions.append(pos)
+                self._save_open_positions()
                 self._last_current_rates[opp.symbol] = opp.funding_rate
                 self.last_strategy_action = StrategyAction.BUY_SPOT_SHORT_PERP
                 self.logger.info(f"✅ Ордера отправлены в MetaScalp (всего открыто: {len(self.active_positions)})")
@@ -1430,6 +1592,7 @@ class FundingArbitrageBot:
                 leverage=self.leverage
             )
             self.positions.append(pos)
+            self._save_open_positions()
             self._last_current_rates[opp.symbol] = opp.funding_rate
             self.last_strategy_action = StrategyAction.SELL_SPOT_LONG_PERP
             self.logger.info(f"🧪 [ТЕСТ] Позиция симулирована (всего открыто: {len(self.active_positions)})")
@@ -1479,6 +1642,7 @@ class FundingArbitrageBot:
                     leverage=self.leverage
                 )
                 self.positions.append(pos)
+                self._save_open_positions()
                 self._last_current_rates[opp.symbol] = opp.funding_rate
                 self.last_strategy_action = StrategyAction.SELL_SPOT_LONG_PERP
                 self.logger.info(f"✅ Ордера отправлены в MetaScalp (всего открыто: {len(self.active_positions)})")
@@ -1519,6 +1683,9 @@ class FundingArbitrageBot:
                 perp_exit_fee=pos.perp_exit_fee
             )
             self._add_trade_record(trade)
+            
+            self.positions.remove(pos)
+            self._save_open_positions()
 
             self.logger.info(f"🧪 [ТЕСТ] Позиция закрыта, PnL: {simulated_pnl:.4f} USDT")
             return True
@@ -1527,6 +1694,8 @@ class FundingArbitrageBot:
             if success:
                 real_pnl = await self._calculate_real_pnl(pos)
                 pos.pnl = real_pnl
+                self.positions.remove(pos)
+                self._save_open_positions()
                 self.logger.info(f"💰 Реальный PnL: {real_pnl:.4f} USDT")
             return success
 
@@ -1577,15 +1746,31 @@ class FundingArbitrageBot:
             return False
 
     # ========================================================================
-    # Основной цикл
+    # Основной цикл (ОПТИМИЗИРОВАН)
     # ========================================================================
 
     async def on_tick(self, opportunities: List[ArbitrageOpportunity]) -> None:
-        # Проверяем условия закрытия для всех активных позиций
+        # Обновляем ставки для ВСЕХ активных позиций
         for pos in self.active_positions:
-            should_close, reason = await self.should_close_position(pos)
-            if should_close:
-                await self.execute_close_position(pos, reason or ExitReason.NORMAL)
+            result = await self._fetch_funding_rate(pos.perp_exchange, pos.symbol)
+            if result:
+                current_rate, _ = result
+                self._last_current_rates[pos.symbol] = current_rate
+                self.logger.info(f"📊 on_tick: обновлена ставка для {pos.symbol}: {current_rate*100:.4f}%")
+            else:
+                self.logger.warning(f"❌ on_tick: не удалось получить ставку для {pos.symbol}")
+        
+        # Проверяем условия закрытия
+        for pos in self.active_positions[:]:
+            current_rate = self._last_current_rates.get(pos.symbol)
+            self.logger.info(f"🔍 Проверка закрытия для {pos.symbol}: current_rate={current_rate}, entry_rate={pos.entry_funding_rate}")
+            if current_rate is not None:
+                should_close, reason = await self._check_close_condition(pos, current_rate)
+                if should_close:
+                    self.logger.info(f"🚨 Закрываем {pos.symbol}, причина: {reason}")
+                    await self.execute_close_position(pos, reason or ExitReason.NORMAL)
+            else:
+                self.logger.warning(f"⚠️ Нет актуальной ставки для {pos.symbol}, пропускаем проверку закрытия")
 
         # Если достигнут лимит — не открываем новые
         if not self.can_open_new_position():
@@ -1631,6 +1816,9 @@ class FundingArbitrageBot:
         else:
             self.whitelist = whitelist
 
+        self.last_scan_time = self.current_timestamp
+
+        opportunities = []
         if whitelist:
             opportunities = await self._scan_all_opportunities(whitelist)
             opportunities.sort(key=lambda x: x.net_profit_bps, reverse=True)
@@ -1640,22 +1828,20 @@ class FundingArbitrageBot:
             for opp in opportunities[:self.max_recent_opportunities]:
                 self.recent_opportunities.append(opp)
 
-            self.last_scan_time = self.current_timestamp
-
             if opportunities:
                 self.opportunities_found += len(opportunities)
 
-                # Логируем топ-5 сигналов в отдельный файл
                 for i, opp in enumerate(opportunities[:5]):
                     self.signal_logger.info(
                         f"#{i+1} | {opp.symbol} | {opp.spot_exchange}/{opp.perp_exchange} | "
                         f"Ставка: {opp.funding_rate*100:.4f}% | Прибыль: {opp.net_profit_bps:.1f} bps | "
                         f"Объём: {opp.volume_24h_usdt:,.0f} USDT | Направление: {opp.direction}"
                     )
-
-                await self.on_tick(opportunities)
         else:
             self.current_opportunities = []
+
+        # ВАЖНО: ВСЕГДА вызываем on_tick, даже если нет новых сигналов!
+        await self.on_tick(opportunities)
 
     async def scan_loop(self) -> None:
         while self.is_running:
@@ -1673,27 +1859,22 @@ class FundingArbitrageBot:
 
 
 # ============================================================================
-# FastAPI приложение
+# FastAPI приложение с lifespan
 # ============================================================================
 
-app = FastAPI(title=f"{BOT_NAME} API", version=__version__)
-bot: Optional[FundingArbitrageBot] = None
-
-
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global bot
     bot = FundingArbitrageBot("config.yaml")
     await bot.initialize()
     asyncio.create_task(bot.scan_loop())
     print(f"🚀 {BOT_NAME} v{__version__} запущен")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global bot
+    yield
     if bot:
         await bot.shutdown()
+
+app = FastAPI(title=f"{BOT_NAME} API", version=__version__, lifespan=lifespan)
+bot: Optional[FundingArbitrageBot] = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1748,6 +1929,24 @@ async def force_scan():
         raise HTTPException(status_code=503, detail="Bot not ready")
     await bot._scan_iteration()
     return {"status": "ok"}
+
+
+@app.post("/api/positions/close")
+async def close_position_manually(data: Dict[str, str]):
+    if not bot:
+        raise HTTPException(status_code=503, detail="Bot not ready")
+    
+    position_id = data.get('position_id')
+    if not position_id:
+        raise HTTPException(status_code=400, detail="position_id is required")
+    
+    pos = bot.find_position_by_id(position_id)
+    if not pos:
+        raise HTTPException(status_code=404, detail="Position not found")
+    
+    asyncio.create_task(bot.execute_close_position(pos, ExitReason.MANUAL))
+    
+    return {"status": "ok", "message": f"Position {pos.symbol} closing initiated"}
 
 
 # ============================================================================

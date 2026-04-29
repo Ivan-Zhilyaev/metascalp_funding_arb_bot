@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Funding Arbitrage Bot v1.5.0</title>
+    <title>Funding Arbitrage Bot v1.6.1</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -61,6 +61,11 @@
         .btn:hover { background: #2ea043; }
         .btn-secondary { background: #30363d; }
         .btn-secondary:hover { background: #3c444d; }
+        .btn-danger {
+            background: #da3633; color: white; border: none; padding: 6px 12px;
+            border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 500;
+        }
+        .btn-danger:hover { background: #f85149; }
         .row { display: flex; gap: 20px; flex-wrap: wrap; }
         .col { flex: 1; min-width: 400px; }
         .badge { padding: 4px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
@@ -76,7 +81,7 @@
         .exchange-checkbox label { font-size: 14px; text-transform: none; color: #c9d1d9; cursor: pointer; }
         .funding-timer {
             background: #1c2128; padding: 8px 15px; border-radius: 6px;
-            display: inline-block; margin-top: 10px;
+            display: inline-block;
         }
         .funding-timer .label { color: #8b949e; margin-right: 10px; }
         .funding-timer .value { font-weight: bold; color: #58a6ff; }
@@ -107,13 +112,17 @@
         }
         .position-symbol { font-size: 18px; font-weight: bold; }
         .position-pnl { font-size: 16px; font-weight: bold; }
+        .position-actions {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>
             🤖 Funding Arbitrage Bot
-            <span class="version" id="bot-version">v1.5.0</span>
+            <span class="version" id="bot-version">v1.6.1</span>
         </h1>
         
         <div class="status-bar" id="status-bar">
@@ -185,7 +194,7 @@
                             <div class="setting-item"><label>Кредитное плечо (фьючерсы)</label><select id="setting-leverage"><option value="1">1x</option><option value="2">2x</option><option value="3">3x</option><option value="5">5x</option><option value="10">10x</option></select></div>
                             <div class="setting-item"><label>Тестовый режим</label><select id="setting-test-mode"><option value="true">ТЕСТОВЫЙ</option><option value="false">ТОРГОВЛЯ</option></select></div>
                             <div class="setting-item"><label>Маржинальная торговля (спот)</label><select id="setting-margin-enabled"><option value="false">Выключена</option><option value="true">Включена</option></select></div>
-                            <div class="setting-item"><label>Макс. одновременных сделок</label><input type="number" id="setting-max-concurrent" min="1" max="10" value="1"></div>
+                            <div class="setting-item"><label>Макс. одновременных сделок</label><input type="number" id="setting-max-concurrent" min="1" max="10" value="5"></div>
                         </div>
                         
                         <div class="section-title">📊 Фильтры ликвидности</div>
@@ -196,7 +205,7 @@
                         
                         <div class="section-title">⏰ Фильтры входа</div>
                         <div class="settings-grid">
-                            <div class="setting-item"><label>Макс. время до выплаты (0=выкл)</label><input type="number" id="setting-max-funding-time" min="0" max="480" step="5"></div>
+                            <div class="setting-item"><label>Мин. время до выплаты (0=выкл)</label><input type="number" id="setting-min-funding-time" min="0" max="480" step="5"></div>
                             <div class="setting-item"><label>Проверять статус торгов</label><select id="setting-check-status"><option value="true">Включено</option><option value="false">Выключено</option></select></div>
                         </div>
                         
@@ -245,7 +254,7 @@
             'normal': '✅ Штатно',
             'funding_rate_sign_changed': '🔄 Смена знака',
             'max_position_age': '⏱️ Таймаут',
-            'manual': '👤 Ручное',
+            'manual': '👤 Вручную',
             'error': '❌ Ошибка',
             'unknown': '❓ Неизвестно'
         };
@@ -311,9 +320,13 @@
                 pnlEl.textContent = formatNumber(data.total_pnl, 2) + ' USDT';
                 pnlEl.className = 'status-value ' + (data.total_pnl >= 0 ? 'green' : 'red');
                 
-                if (data.last_scan_time) {
-                    document.getElementById('last-scan-time').textContent = 
-                        'Обновлено: ' + new Date(data.last_scan_time * 1000).toLocaleTimeString('ru-RU');
+                // ИСПРАВЛЕНО: обновление времени с защитой от null
+                const timeElement = document.getElementById('last-scan-time');
+                if (timeElement && data.last_scan_time) {
+                    const timeStr = new Date(data.last_scan_time * 1000).toLocaleTimeString('ru-RU');
+                    timeElement.textContent = 'Обновлено: ' + timeStr;
+                } else if (timeElement) {
+                    timeElement.textContent = 'Обновлено: —';
                 }
                 
                 // Открытые позиции
@@ -327,11 +340,11 @@
                         const directionClass = p.direction === 'BUY_SPOT_SHORT_PERP' ? 'success' : 'danger';
                         
                         const entryRate = p.entry_funding_rate;
-                        const currentRate = data.current_funding_rate;
+                        // ИСПРАВЛЕНО: получаем актуальную ставку из словаря current_funding_rates
+                        const currentRate = data.current_funding_rates?.[p.symbol] || data.current_funding_rate;
                         const entryRateColor = entryRate > 0 ? '#3fb950' : '#f85149';
                         const currentRateColor = currentRate !== null && currentRate > 0 ? '#3fb950' : '#f85149';
                         
-                        // Ставка через дробь: вход / текущая
                         const rateDisplay = currentRate !== null 
                             ? `<span style="color:${entryRateColor}">${(entryRate * 100).toFixed(4)}%</span> / <span style="color:${currentRateColor}">${(currentRate * 100).toFixed(4)}%</span>` 
                             : `<span style="color:${entryRateColor}">${(entryRate * 100).toFixed(4)}%</span>`;
@@ -339,8 +352,11 @@
                         const simulatedPnl = p.pnl || 0;
                         const pnlColor = simulatedPnl >= 0 ? '#3fb950' : '#f85149';
                         
+                        const positionId = p.position_id || `${p.symbol}_${p.spot_exchange}_${p.perp_exchange}_${p.entry_time}`;
+                        const fundingTimeStr = p.funding_time_str || data.next_funding_time_str || '—';
+                        
                         html += `
-                            <div class="position-card">
+                            <div class="position-card" id="pos-${positionId.replace(/[^a-zA-Z0-9]/g, '_')}">
                                 <div class="position-header">
                                     <span class="position-symbol">${p.symbol}</span>
                                     <span class="position-pnl" style="color:${pnlColor}">${simulatedPnl >= 0 ? '+' : ''}${formatNumber(simulatedPnl, 4)} USDT</span>
@@ -353,10 +369,15 @@
                                     <tr><td>Ставка (вход / тек):</td><td>${rateDisplay}</td></tr>
                                     <tr><td>Время входа:</td><td>${formatFullDateTime(p.entry_time ? new Date(p.entry_time * 1000).toISOString() : null)}</td></tr>
                                 </table>
-                                <div class="funding-timer">
-                                    <span class="label">⏱️ Следующая выплата:</span>
-                                    <span class="value">${formatFundingTime(p.next_funding_time)}</span>
-                                    <span style="margin-left: 10px; color: #8b949e;">(через ${data.next_funding_time_str || '—'})</span>
+                                <div class="position-actions">
+                                    <div class="funding-timer">
+                                        <span class="label">⏱️ Следующая выплата:</span>
+                                        <span class="value">${formatFundingTime(p.next_funding_time)}</span>
+                                        <span style="margin-left: 10px; color: #8b949e;">(через ${fundingTimeStr})</span>
+                                    </div>
+                                    <button class="btn-danger" onclick="closePosition('${positionId}')">
+                                        🔒 Закрыть вручную
+                                    </button>
                                 </div>
                             </div>
                         `;
@@ -490,10 +511,10 @@
                     document.getElementById('setting-test-mode').value = String(data.config.test_mode || true);
                     document.getElementById('setting-leverage').value = data.config.leverage || 3;
                     document.getElementById('setting-margin-enabled').value = String(data.config.margin_enabled || false);
-                    document.getElementById('setting-max-concurrent').value = data.config.max_concurrent_positions || 1;
+                    document.getElementById('setting-max-concurrent').value = data.config.max_concurrent_positions || 5;
                     document.getElementById('setting-min-volume').value = data.config.min_volume_24h_usdt || 10000;
                     document.getElementById('setting-max-slippage').value = data.config.max_slippage_pct || 1.0;
-                    document.getElementById('setting-max-funding-time').value = data.config.max_time_to_funding_minutes || 0;
+                    document.getElementById('setting-min-funding-time').value = data.config.min_time_to_funding_minutes || 0;
                     document.getElementById('setting-check-status').value = String(data.config.check_trading_status !== false);
                     document.getElementById('setting-deduct-fees').value = String(data.config.deduct_fees_from_profit !== false);
                     document.getElementById('setting-manual-spot-fee').value = data.config.manual_spot_fee_pct || 0.1;
@@ -525,10 +546,10 @@
                 test_mode: document.getElementById('setting-test-mode').value === 'true',
                 leverage: parseInt(document.getElementById('setting-leverage').value),
                 margin_enabled: document.getElementById('setting-margin-enabled').value === 'true',
-                max_concurrent_positions: parseInt(document.getElementById('setting-max-concurrent').value) || 1,
+                max_concurrent_positions: parseInt(document.getElementById('setting-max-concurrent').value) || 5,
                 min_volume_24h_usdt: parseFloat(document.getElementById('setting-min-volume').value),
                 max_slippage_pct: parseFloat(document.getElementById('setting-max-slippage').value),
-                max_time_to_funding_minutes: parseInt(document.getElementById('setting-max-funding-time').value) || 0,
+                min_time_to_funding_minutes: parseInt(document.getElementById('setting-min-funding-time').value) || 0,
                 check_trading_status: document.getElementById('setting-check-status').value === 'true',
                 deduct_fees_from_profit: document.getElementById('setting-deduct-fees').value === 'true',
                 manual_spot_fee_pct: parseFloat(document.getElementById('setting-manual-spot-fee').value) || 0.1,
@@ -563,6 +584,31 @@
                 loadStatus();
             } catch (error) {
                 alert('Ошибка сохранения бирж');
+            }
+        }
+        
+        async function closePosition(positionId) {
+            if (!confirm('Вы уверены, что хотите закрыть эту позицию вручную?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/positions/close`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ position_id: positionId })
+                });
+                
+                const data = await response.json();
+                if (data.status === 'ok') {
+                    alert('Позиция закрывается...');
+                    setTimeout(() => loadStatus(), 1000);
+                } else {
+                    alert('Ошибка: ' + (data.message || 'Неизвестная ошибка'));
+                }
+            } catch (error) {
+                console.error('Ошибка закрытия позиции:', error);
+                alert('Ошибка при отправке запроса');
             }
         }
         
