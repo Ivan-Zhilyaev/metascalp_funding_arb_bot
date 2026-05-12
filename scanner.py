@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Funding Rate Arbitrage Scanner + Executor for MetaScalp
-Version: 1.6.2
+Version: 2.6.2
 """
 
 import os
@@ -10,6 +10,7 @@ import json
 import time
 import logging
 import asyncio
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Any, Tuple
@@ -31,7 +32,7 @@ import uvicorn
 # Версия
 # ============================================================================
 
-__version__ = "1.6.2"
+__version__ = "2.6.2"
 BOT_NAME = "Funding Arbitrage Bot"
 
 
@@ -46,12 +47,6 @@ class StrategyState(Enum):
     CLOSING = "closing"
 
 
-class StrategyAction(Enum):
-    NULL = "null"
-    BUY_SPOT_SHORT_PERP = "buy_spot_short_perp"
-    SELL_SPOT_LONG_PERP = "sell_spot_long_perp"
-
-
 class ConnectionState(Enum):
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
@@ -63,9 +58,24 @@ class ExitReason(Enum):
     NORMAL = "normal"
     FUNDING_RATE_SIGN_CHANGED = "funding_rate_sign_changed"
     MAX_POSITION_AGE = "max_position_age"
+    FIRST_FUNDING_PAID = "first_funding_paid"
+    LIQUIDATION_RISK = "liquidation_risk"
     MANUAL = "manual"
     ERROR = "error"
     UNKNOWN = "unknown"
+
+    def russian(self) -> str:
+        names = {
+            'normal': '✅ Штатно',
+            'funding_rate_sign_changed': '🔄 Смена знака',
+            'max_position_age': '⏱️ Таймаут',
+            'first_funding_paid': '💰 Первая выплата',
+            'liquidation_risk': '⚠️ Ликвидация',
+            'manual': '👤 Вручную',
+            'error': '❌ Ошибка',
+            'unknown': '❓ Неизвестно',
+        }
+        return names.get(self.value, self.value)
 
 
 @dataclass
@@ -131,6 +141,11 @@ class Position:
     perp_entry_fee: float = 0.0
     spot_exit_fee: float = 0.0
     perp_exit_fee: float = 0.0
+    entry_perp_price: float = 0.0
+    funding_payments_received: float = 0.0
+    funding_payments_count: int = 0
+    last_funding_time: Optional[float] = None
+    close_in_progress: bool = False
 
 
 @dataclass
@@ -173,6 +188,19 @@ class TradeRecord:
         }
 
 
+@dataclass
+class CachedInstrument:
+    """Запись в кэше Уровня 0"""
+    symbol: str
+    spot_exchange: str
+    perp_exchange: str
+    funding_rate: float = 0.0
+    preliminary_profit_bps: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 # ============================================================================
 # Главный класс бота
 # ============================================================================
@@ -185,12 +213,16 @@ class FundingArbitrageBot:
         self.config = self._load_config(config_path)
         self._setup_logging()
 
+        # === Время старта ===
+        self.start_time: float = time.time()
+
         # === Состояние стратегии ===
         self.strategy_state = StrategyState.CLOSED
-        self.last_strategy_action = StrategyAction.NULL
         self.positions: List[Position] = []
         self._last_current_rates: Dict[str, float] = {}
-        self._pending_exit_reason: Optional[ExitReason] = None
+        self._last_perp_prices: Dict[str, float] = {}
+        self._last_signal_log_set: Set[str] = set()
+        self._opening_symbols: Set[str] = set()
 
         # === Тайминги ===
         self.in_flight_state_start_ts: float = 0
@@ -199,14 +231,11 @@ class FundingArbitrageBot:
         self.opened_state_tolerance: int = self.config.get('opened_state_tolerance', 7200)
         self.next_arbitrage_opening_ts: float = 0
         self.next_arbitrage_opening_delay: int = self.config.get('next_arbitrage_opening_delay', 10)
-        self.max_concurrent_positions: int = self.config.get('max_concurrent_positions', 1)
-
-        # === Белый список ===
-        self.whitelist: Set[str] = set()
-        self.whitelist_mtime: float = 0
+        self.max_positions_per_side: int = self.config.get('max_positions_per_side', 5)
 
         # === MetaScalp ===
         self.metascalp_port: Optional[int] = None
+        self.metascalp_version: str = "unknown"
         self.metascalp_session: Optional[aiohttp.ClientSession] = None
         self.metascalp_state = ConnectionState.DISCONNECTED
         self.metascalp_connections: Dict[str, Dict] = {}
@@ -219,15 +248,18 @@ class FundingArbitrageBot:
         # === Режимы ===
         self.auto_test_mode = True
         self.manual_test_mode = self.config.get('test_mode', True)
+        self.trading_enabled = self.config.get('trading_enabled', True)
 
         # === CCXT биржи ===
         self.exchanges: Dict[str, ccxt.Exchange] = {}
         self.exchanges_online: Dict[str, bool] = {}
 
+        # === HTTP сессия ===
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
         # === Параметры ===
         self.base_order_amount = self.config.get('base_order_amount', 100.0)
         self.min_profit_bps = self.config.get('min_profit_bps', 10)
-        self.slippage_buffer_bps = self.config.get('slippage_bps', 15)
         self.funding_rate_threshold = self.config.get('funding_rate_threshold', 0.0001)
         self.scan_interval = self.config.get('scan_interval', 5)
         self.leverage = self.config.get('leverage', 3)
@@ -236,6 +268,7 @@ class FundingArbitrageBot:
         self.max_slippage_pct = self.config.get('max_slippage_pct', 1.0)
         self.max_recent_opportunities = self.config.get('max_recent_opportunities', 5)
         self.max_current_opportunities = self.config.get('max_current_opportunities', 5)
+        self.max_price_change_pct = self.config.get('max_price_change_pct', 15)
 
         # === Фильтры ===
         self.min_time_to_funding_minutes = self.config.get('min_time_to_funding_minutes', 0)
@@ -243,6 +276,25 @@ class FundingArbitrageBot:
         self.deduct_fees_from_profit = self.config.get('deduct_fees_from_profit', True)
         self.manual_spot_fee_pct = self.config.get('manual_spot_fee_pct', 0.1)
         self.manual_futures_fee_pct = self.config.get('manual_futures_fee_pct', 0.05)
+
+        # === Закрытие ===
+        self.max_position_age_hours = self.config.get('max_position_age_hours', 24)
+        self.post_funding_close_delay = self.config.get('post_funding_close_delay_minutes', 5)
+
+        # === Оптимизация ===
+        self.max_concurrent_requests = self.config.get('max_concurrent_requests', 20)
+        self.max_concurrent_cache_requests = self.config.get('max_concurrent_cache_requests', 30)
+        self.cache_rebuild_interval = self.config.get('cache_rebuild_interval_minutes', 30)
+        self.normalize_symbols = self.config.get('normalize_symbols', True)
+        self.cache_max_instruments = self.config.get('cache_max_instruments', 500)
+
+        # === Кэш ===
+        self.instrument_cache: List[CachedInstrument] = []
+        self.cache_last_updated: float = 0
+        self.cache_total_futures_found: int = 0
+        self.cache_filtered_by_profit: int = 0
+        self.cache_filtered_by_no_spot: int = 0
+        self.cache_filtered_by_status: int = 0
 
         # === Кэш комиссий ===
         self.spot_fees_cache: Dict[str, Dict[str, float]] = {}
@@ -255,8 +307,9 @@ class FundingArbitrageBot:
         self.trades_history: List[TradeRecord] = []
         self._load_trades_history()
 
-        # === Файл открытых позиций ===
+        # === Файлы ===
         self.open_positions_file = self.config.get('open_positions_file', 'logs/open_positions.json')
+        self.cache_file = self.config.get('cache_file', 'logs/instrument_cache.json')
 
         # === Статистика ===
         self.scan_count = 0
@@ -267,6 +320,8 @@ class FundingArbitrageBot:
         self.filtered_by_time = 0
         self.filtered_by_status = 0
         self.filtered_by_fees = 0
+        self.filtered_by_rate_threshold = 0
+        self.filtered_by_symbol_mismatch = 0
         self.total_pnl = 0.0
         for trade in self.trades_history:
             self.total_pnl += trade.pnl
@@ -274,6 +329,10 @@ class FundingArbitrageBot:
         # === Управление циклом ===
         self.is_running = True
         self.scan_task: Optional[asyncio.Task] = None
+
+        # === Telegram Bot ===
+        self.telegram_enabled = self.config.get('telegram_enabled', False)
+        self.tg_manager = None
 
         self._log_startup_info()
 
@@ -290,9 +349,19 @@ class FundingArbitrageBot:
             'max_slippage_pct': 1.0, 'max_recent_opportunities': 5, 'max_current_opportunities': 5,
             'min_time_to_funding_minutes': 0, 'check_trading_status': True,
             'deduct_fees_from_profit': True, 'manual_spot_fee_pct': 0.1, 'manual_futures_fee_pct': 0.05,
-            'balance_update_interval': 30, 'max_concurrent_positions': 1,
+            'balance_update_interval': 30, 'max_positions_per_side': 5,
+            'trading_enabled': True, 'max_price_change_pct': 15,
             'signal_log_file': 'logs/signal.log', 'open_positions_file': 'logs/open_positions.json',
-            'fallback_priority': ['binance', 'bybit', 'gate', 'kucoin', 'mexc', 'okx', 'bitget']
+            'cache_file': 'logs/instrument_cache.json',
+            'max_position_age_hours': 24,
+            'post_funding_close_delay_minutes': 5,
+            'max_concurrent_requests': 20,
+            'max_concurrent_cache_requests': 30,
+            'cache_rebuild_interval_minutes': 30,
+            'normalize_symbols': True,
+            'cache_max_instruments': 500,
+            'metascalp_connection_check_interval': 60,
+            'telegram_enabled': False,
         }
         for key, value in defaults.items():
             if key not in config:
@@ -324,8 +393,9 @@ class FundingArbitrageBot:
             ]
         )
         self.logger = logging.getLogger(__name__)
+        for lib in ['telegram', 'httpx', 'httpcore', 'telegram.ext', 'telegram.vendor', 'apscheduler', 'uvicorn.access']:
+            logging.getLogger(lib).setLevel(logging.WARNING)
 
-        # Отдельный логгер для сигналов с ротацией
         signal_log_file = self.config.get('signal_log_file', 'logs/signal.log')
         Path(signal_log_file).parent.mkdir(parents=True, exist_ok=True)
 
@@ -376,87 +446,6 @@ class FundingArbitrageBot:
         self.total_pnl += trade.pnl
         self._save_trades_history()
 
-    # ========================================================================
-    # Персистентность открытых позиций
-    # ========================================================================
-
-    def _load_open_positions(self) -> None:
-        """Загрузка открытых позиций из файла"""
-        try:
-            path = Path(self.open_positions_file)
-            if path.exists():
-                with open(path, 'r') as f:
-                    data = json.load(f)
-                    for p in data:
-                        pos = Position(**p)
-                        self.positions.append(pos)
-                self.logger.info(f"📂 Загружено {len(self.positions)} открытых позиций из файла")
-            else:
-                self.logger.info("📂 Файл открытых позиций не найден, начинаем с пустого списка")
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка загрузки открытых позиций: {e}")
-
-    def _save_open_positions(self) -> None:
-        """Сохранение открытых позиций в файл"""
-        try:
-            path = Path(self.open_positions_file)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            active = [asdict(p) for p in self.active_positions]
-            with open(path, 'w') as f:
-                json.dump(active, f, indent=2)
-            self.logger.debug(f"💾 Сохранено {len(active)} открытых позиций")
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка сохранения открытых позиций: {e}")
-
-    async def _check_perp_position_exists(self, pos: Position) -> bool:
-        """Проверяет, существует ли фьючерсная позиция на бирже через MetaScalp API"""
-        if pos.perp_exchange not in self.metascalp_connections:
-            return False
-        
-        perp_conn_id = self.metascalp_connections[pos.perp_exchange].get('perp_id')
-        if not perp_conn_id:
-            return False
-
-        try:
-            async with self.metascalp_session.get(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{perp_conn_id}/positions"
-            ) as resp:
-                if resp.status != 200:
-                    return False
-                data = await resp.json()
-                clean_symbol = pos.symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
-                
-                for real_pos in data.get('Positions', []):
-                    if real_pos.get('Ticker') == clean_symbol:
-                        if pos.direction == 'BUY_SPOT_SHORT_PERP' and real_pos.get('Side') == 2:
-                            return True
-                        elif pos.direction == 'SELL_SPOT_LONG_PERP' and real_pos.get('Side') == 1:
-                            return True
-                return False
-        except Exception as e:
-            self.logger.debug(f"Ошибка проверки позиции {pos.symbol}: {e}")
-            return False
-
-    async def _sync_positions_with_exchange(self) -> None:
-        """Синхронизация позиций из файла с реальными на бирже (только для реальной торговли)"""
-        if self.is_test_mode:
-            self.logger.info(f"🧪 Тестовый режим: {len(self.positions)} позиций загружено из файла")
-            return
-
-        self.logger.info("🔄 Синхронизация позиций с биржей...")
-        valid_positions = []
-        
-        for pos in self.positions:
-            if await self._check_perp_position_exists(pos):
-                valid_positions.append(pos)
-                self.logger.info(f"   ✅ Позиция {pos.symbol} на {pos.perp_exchange} подтверждена")
-            else:
-                self.logger.warning(f"   ❌ Позиция {pos.symbol} на {pos.perp_exchange} не найдена на бирже, удалена")
-        
-        self.positions = valid_positions
-        self._save_open_positions()
-        self.logger.info(f"✅ Синхронизация завершена, осталось {len(self.positions)} позиций")
-
     def _log_startup_info(self) -> None:
         self.logger.info("=" * 70)
         self.logger.info(f"🤖 {BOT_NAME} v{__version__}")
@@ -467,9 +456,13 @@ class FundingArbitrageBot:
         self.logger.info(f"✅ Активные биржи: {', '.join(self.config['active_exchanges'])}")
         self.logger.info(f"💵 Размер позиции: {self.base_order_amount} USDT")
         self.logger.info(f"⚡ Плечо (фьючерсы): {self.leverage}x")
-        self.logger.info(f"📈 Маржинальная торговля (спот): {'ВКЛЮЧЕНА' if self.margin_enabled else 'ВЫКЛЮЧЕНА'}")
-        self.logger.info(f"🔢 Макс. одновременных сделок: {self.max_concurrent_positions}")
+        self.logger.info(f"📈 Маржинальная торговля: {'ВКЛЮЧЕНА' if self.margin_enabled else 'ВЫКЛЮЧЕНА'}")
+        self.logger.info(f"🔢 Макс. позиций на сторону: {self.max_positions_per_side}")
+        self.logger.info(f"🛡️ Защита от ликвидации: {self.max_price_change_pct}%")
         self.logger.info(f"⏰ Мин. время до выплаты: {self.min_time_to_funding_minutes} мин")
+        self.logger.info(f"⏱️ Макс. время удержания: {self.max_position_age_hours}ч")
+        self.logger.info(f"🔄 Перестроение кэша: каждые {self.cache_rebuild_interval} мин")
+        self.logger.info(f"🔤 Нормализация тикеров: {'ВКЛЮЧЕНА' if self.normalize_symbols else 'ВЫКЛЮЧЕНА'}")
         self.logger.info("=" * 70)
 
     # ========================================================================
@@ -505,311 +498,71 @@ class FundingArbitrageBot:
     # Управление позициями
     # ========================================================================
 
-    def can_open_new_position(self) -> bool:
-        return len(self.active_positions) < self.max_concurrent_positions
+    def can_open_long_position(self) -> bool:
+        count = sum(1 for p in self.active_positions if p.direction == 'BUY_SPOT_SHORT_PERP')
+        return count < self.max_positions_per_side
+
+    def can_open_short_position(self) -> bool:
+        count = sum(1 for p in self.active_positions if p.direction == 'SELL_SPOT_LONG_PERP')
+        return count < self.max_positions_per_side
 
     def is_position_already_open(self, symbol: str, spot_ex: str, perp_ex: str) -> bool:
-        """Проверяет, открыта ли уже ТОЧНО ТАКАЯ ЖЕ позиция (символ + спот + перп)"""
         for p in self.active_positions:
             if p.symbol == symbol and p.spot_exchange == spot_ex and p.perp_exchange == perp_ex:
                 return True
         return False
 
     def find_position_by_id(self, position_id: str) -> Optional[Position]:
-        """Находит позицию по уникальному идентификатору"""
         for pos in self.active_positions:
             pos_id = f"{pos.symbol}_{pos.spot_exchange}_{pos.perp_exchange}_{pos.entry_time}"
             if pos_id == position_id:
                 return pos
         return None
 
-    # ========================================================================
-    # Синхронизация с MetaScalp
-    # ========================================================================
+    def get_position_estimated_pnl(self, pos: Position) -> float:
+        if pos.close_time:
+            return pos.pnl or 0.0
 
-    def _sync_exchanges_from_metascalp(self) -> None:
-        if not self.metascalp_connections:
-            return
+        received = pos.funding_payments_received
+        current_rate = self._last_current_rates.get(pos.symbol, pos.entry_funding_rate)
+        last_time = pos.last_funding_time or pos.entry_time
+        hours_since_last = max(0, (self.current_timestamp - last_time) / 3600)
+        pending = pos.size_usdt * abs(current_rate) * (hours_since_last / 8)
+        entry_fees = pos.spot_entry_fee + pos.perp_entry_fee
+        exit_fees = pos.spot_exit_fee + pos.perp_exit_fee
 
-        current_enabled = set(self.config.get('enabled_exchanges', []))
-        metascalp_exchanges = set(self.metascalp_connections.keys())
-        new_exchanges = metascalp_exchanges - current_enabled
-
-        if new_exchanges:
-            self.config['enabled_exchanges'] = sorted(list(current_enabled | metascalp_exchanges))
-            self._save_config()
-            self.logger.info(f"📝 Добавлены новые биржи из MetaScalp: {', '.join(new_exchanges)}")
-
-    def _sync_exchange_pairs_from_metascalp(self) -> None:
-        if not self.metascalp_connections:
-            return
-
-        active_exchanges = set(self.config.get('active_exchanges', []))
-        spot_exchanges = [ex for ex, conns in self.metascalp_connections.items() 
-                         if 'spot_id' in conns and ex in active_exchanges]
-        perp_exchanges = [ex for ex, conns in self.metascalp_connections.items() 
-                         if 'perp_id' in conns and ex in active_exchanges]
-
-        if not spot_exchanges or not perp_exchanges:
-            return
-
-        new_pairs = []
-        for spot_ex in spot_exchanges:
-            for perp_ex in perp_exchanges:
-                new_pairs.append({'spot': spot_ex, 'perp': perp_ex})
-
-        current_pairs = self.config.get('exchange_pairs', [])
-        current_pairs_set = {f"{p['spot']}|{p['perp']}" for p in current_pairs}
-        new_pairs_set = {f"{p['spot']}|{p['perp']}" for p in new_pairs}
-        added_pairs = new_pairs_set - current_pairs_set
-
-        if added_pairs:
-            for pair_str in added_pairs:
-                spot, perp = pair_str.split('|')
-                current_pairs.append({'spot': spot, 'perp': perp})
-
-            self.config['exchange_pairs'] = current_pairs
-            self._save_config()
-            self.logger.info(f"📝 Добавлены новые пары бирж в exchange_pairs: {len(added_pairs)} шт.")
-            self.logger.info(f"   Всего комбинаций: {len(current_pairs)} (спот: {len(spot_exchanges)}, перп: {len(perp_exchanges)})")
-
-    async def _update_metascalp_balances(self) -> None:
-        if not self.metascalp_session or self.metascalp_state != ConnectionState.CONNECTED:
-            self.logger.debug("MetaScalp не подключен, балансы не обновляются")
-            return
-
-        now = time.time()
-        if now - self.last_balance_update < self.balance_update_interval:
-            return
-        self.last_balance_update = now
-
-        self.logger.info("🔄 Обновление балансов MetaScalp...")
-        updated_count = 0
-
-        for ex_name, conns in self.metascalp_connections.items():
-            if conns.get('view_mode', False):
-                self.logger.debug(f"   ⏭️ {ex_name.upper()} пропущен (ViewMode)")
-                continue
-
-            for conn_type, conn_id in [('spot_id', conns.get('spot_id')), ('perp_id', conns.get('perp_id'))]:
-                if conn_id:
-                    try:
-                        async with self.metascalp_session.get(
-                            f"http://127.0.0.1:{self.metascalp_port}/api/connections/{conn_id}/balance"
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                balances = data.get('balances', data.get('Balances', []))
-                                for b in balances:
-                                    if b.get('Coin') == 'USDT':
-                                        balance = float(b.get('Free', 0))
-                                        self.metascalp_balances[conn_id] = balance
-                                        self.logger.info(f"   💰 {ex_name.upper()} {conn_type}: {balance:.6f} USDT")
-                                        updated_count += 1
-                                        break
-                            else:
-                                self.logger.debug(f"   ⚠️ {ex_name} {conn_type}: HTTP {resp.status}")
-                    except Exception as e:
-                        self.logger.debug(f"   ❌ {ex_name} {conn_type}: {e}")
-
-        self.logger.info(f"✅ Обновлено балансов: {updated_count}")
+        return received + pending - entry_fees - exit_fees
 
     # ========================================================================
-    # Управление конфигурацией
+    # MetaScalp
     # ========================================================================
-
-    def update_config(self, updates: Dict[str, Any]) -> None:
-        old_deduct_fees = self.config.get('deduct_fees_from_profit', True)
-        
-        for key, value in updates.items():
-            if key in self.config:
-                self.config[key] = value
-                self.logger.info(f"📝 Конфиг обновлён: {key} = {value}")
-
-        self.scan_interval = self.config.get('scan_interval', 5)
-        self.manual_test_mode = self.config.get('test_mode', True)
-        self.base_order_amount = self.config.get('base_order_amount', 100.0)
-        self.min_profit_bps = self.config.get('min_profit_bps', 10)
-        self.leverage = self.config.get('leverage', 3)
-        self.margin_enabled = self.config.get('margin_enabled', False)
-        self.min_volume_24h_usdt = self.config.get('min_volume_24h_usdt', 10000)
-        self.max_slippage_pct = self.config.get('max_slippage_pct', 1.0)
-        self.min_time_to_funding_minutes = self.config.get('min_time_to_funding_minutes', 0)
-        self.check_trading_status = self.config.get('check_trading_status', True)
-        self.deduct_fees_from_profit = self.config.get('deduct_fees_from_profit', True)
-        self.manual_spot_fee_pct = self.config.get('manual_spot_fee_pct', 0.1)
-        self.manual_futures_fee_pct = self.config.get('manual_futures_fee_pct', 0.05)
-        self.balance_update_interval = self.config.get('balance_update_interval', 30)
-        self.max_concurrent_positions = self.config.get('max_concurrent_positions', 1)
-
-        if old_deduct_fees and not self.deduct_fees_from_profit:
-            self.spot_fees_cache.clear()
-            self.futures_fees_cache.clear()
-            self.logger.info("🧹 Кэш комиссий очищен")
-
-        if self.manual_test_mode:
-            self.auto_test_mode = False
-
-        new_max = self.config.get('max_recent_opportunities', 5)
-        if new_max != self.recent_opportunities.maxlen:
-            old_items = list(self.recent_opportunities)
-            self.recent_opportunities = deque(old_items, maxlen=new_max)
-
-        self.max_current_opportunities = self.config.get('max_current_opportunities', 5)
-
-        self._save_config()
-        self.logger.info(f"🔄 Режим работы: {'ТЕСТОВЫЙ' if self.is_test_mode else 'ТОРГОВЛЯ'}")
-
-    def update_active_exchanges(self, exchanges: List[str]) -> None:
-        valid_exchanges = [e for e in exchanges if e in self.config['enabled_exchanges']]
-        self.config['active_exchanges'] = valid_exchanges
-        self._save_config()
-        self.logger.info(f"📝 Активные биржи обновлены: {', '.join(valid_exchanges)}")
-        self._sync_exchange_pairs_from_metascalp()
-
-    def get_status(self) -> dict:
-        active_positions = self.active_positions
-        first_position = active_positions[0] if active_positions else None
-        
-        positions_with_id = []
-        for p in active_positions:
-            p_dict = asdict(p)
-            p_dict['position_id'] = f"{p.symbol}_{p.spot_exchange}_{p.perp_exchange}_{p.entry_time}"
-            
-            if p.next_funding_time:
-                time_to_funding = p.next_funding_time - self.current_timestamp
-                if time_to_funding > 0:
-                    hours = int(time_to_funding // 3600)
-                    minutes = int((time_to_funding % 3600) // 60)
-                    p_dict['funding_time_str'] = f"{hours}ч {minutes}м"
-                else:
-                    p_dict['funding_time_str'] = "выплата идёт"
-            else:
-                p_dict['funding_time_str'] = "—"
-            
-            positions_with_id.append(p_dict)
-        
-        next_funding_str = positions_with_id[0]['funding_time_str'] if positions_with_id else None
-
-        current_rates = {}
-        for pos in active_positions:
-            rate = self._last_current_rates.get(pos.symbol)
-            self.logger.debug(f"📊 get_status: {pos.symbol} -> {rate}")
-            if rate is not None:
-                current_rates[pos.symbol] = rate
-
-        return {
-            'version': __version__,
-            'bot_name': BOT_NAME,
-            'timestamp': self.current_timestamp,
-            'datetime': datetime.now().isoformat(),
-            'strategy_state': self.strategy_state.value,
-            'connection_state': self.metascalp_state.value,
-            'exchange_status': self.exchange_status,
-            'test_mode': self.is_test_mode,
-            'auto_test_mode': self.auto_test_mode,
-            'metascalp_port': self.metascalp_port,
-            'metascalp_connections': self.metascalp_connections,
-            'metascalp_balances': self.metascalp_balances,
-            'positions': positions_with_id,
-            'position': asdict(first_position) if first_position else None,
-            'active_positions_count': len(active_positions),
-            'current_funding_rate': current_rates.get(first_position.symbol) if first_position else None,
-            'current_funding_rates': current_rates,
-            'next_funding_time_str': next_funding_str,
-            'scan_count': self.scan_count,
-            'opportunities_found': self.opportunities_found,
-            'filtered_by_volume': self.filtered_by_volume,
-            'filtered_by_spread': self.filtered_by_spread,
-            'filtered_by_margin': self.filtered_by_margin,
-            'filtered_by_time': self.filtered_by_time,
-            'filtered_by_status': self.filtered_by_status,
-            'filtered_by_fees': self.filtered_by_fees,
-            'total_pnl': self.total_pnl,
-            'trades_count': len(self.trades_history),
-            'current_opportunities': [o.to_dict() for o in self.current_opportunities],
-            'recent_opportunities': [o.to_dict() for o in self.recent_opportunities],
-            'last_scan_time': self.last_scan_time,
-            'config': {
-                'enabled_exchanges': self.config.get('enabled_exchanges', []),
-                'active_exchanges': self.config.get('active_exchanges', []),
-                'scan_interval': self.scan_interval,
-                'base_order_amount': self.base_order_amount,
-                'min_profit_bps': self.min_profit_bps,
-                'test_mode': self.manual_test_mode,
-                'leverage': self.leverage,
-                'margin_enabled': self.margin_enabled,
-                'min_volume_24h_usdt': self.min_volume_24h_usdt,
-                'max_slippage_pct': self.max_slippage_pct,
-                'max_recent_opportunities': self.max_recent_opportunities,
-                'max_current_opportunities': self.max_current_opportunities,
-                'min_time_to_funding_minutes': self.min_time_to_funding_minutes,
-                'check_trading_status': self.check_trading_status,
-                'deduct_fees_from_profit': self.deduct_fees_from_profit,
-                'manual_spot_fee_pct': self.manual_spot_fee_pct,
-                'manual_futures_fee_pct': self.manual_futures_fee_pct,
-                'balance_update_interval': self.balance_update_interval,
-                'max_concurrent_positions': self.max_concurrent_positions
-            },
-            'trades_history': [t.to_dict() for t in self.trades_history[-10:]]
-        }
-
-    # ========================================================================
-    # Инициализация и завершение
-    # ========================================================================
-
-    async def initialize(self) -> None:
-        await self._init_exchanges()
-        await self._connect_metascalp()
-        self._load_open_positions()
-        await self._sync_positions_with_exchange()
-        
-        # Запрашиваем актуальные ставки для всех загруженных позиций
-        self.logger.info(f"🔄 Загрузка актуальных ставок для {len(self.positions)} позиций...")
-        for pos in self.positions:
-            if not pos.close_time:
-                self.logger.info(f"   Запрос ставки для {pos.symbol} на {pos.perp_exchange}...")
-                result = await self._fetch_funding_rate(pos.perp_exchange, pos.symbol)
-                if result:
-                    current_rate, _ = result
-                    self._last_current_rates[pos.symbol] = current_rate
-                    self.logger.info(f"   ✅ Ставка для {pos.symbol}: {current_rate*100:.4f}%")
-                else:
-                    self.logger.warning(f"   ❌ Не удалось получить ставку для {pos.symbol}")
 
     async def _connect_metascalp(self) -> bool:
         self.metascalp_state = ConnectionState.CONNECTING
-
         port = await self._discover_metascalp_port()
         if not port:
             self.logger.warning("⚠️ MetaScalp не найден.")
             self.metascalp_state = ConnectionState.DISCONNECTED
             if not self.manual_test_mode:
                 self.auto_test_mode = True
-                self.logger.warning("🔶 Включён АВТО-ТЕСТОВЫЙ режим (нет MetaScalp)")
             return False
-
         self.metascalp_port = port
-
         if self.metascalp_session:
             await self.metascalp_session.close()
         self.metascalp_session = aiohttp.ClientSession()
-
+        if self._http_session:
+            await self._http_session.close()
+        self._http_session = aiohttp.ClientSession()
         success = await self._fetch_connection_ids()
-
         if success:
             self.metascalp_state = ConnectionState.CONNECTED
             self.metascalp_reconnect_attempts = 0
             self.auto_test_mode = False
             self._log_metascalp_connections()
-            self._sync_exchanges_from_metascalp()
-            self._sync_exchange_pairs_from_metascalp()
             self.last_balance_update = 0
             await self._update_metascalp_balances()
-            self.logger.info(f"🔄 Режим работы: {'ТЕСТОВЫЙ' if self.is_test_mode else 'ТОРГОВЛЯ'}")
             return True
         else:
-            self.logger.warning("⚠️ Не удалось получить ID подключений.")
             self.metascalp_state = ConnectionState.DISCONNECTED
             if not self.manual_test_mode:
                 self.auto_test_mode = True
@@ -819,15 +572,13 @@ class FundingArbitrageBot:
         for port in range(17845, 17856):
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"http://127.0.0.1:{port}/ping",
-                        timeout=aiohttp.ClientTimeout(total=1)
-                    ) as resp:
+                    async with session.get(f"http://127.0.0.1:{port}/ping", timeout=aiohttp.ClientTimeout(total=1)) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            app_name = data.get("App") or data.get("app") or ""
-                            if app_name == "MetaScalp":
-                                version = data.get("Version") or data.get("vers") or "unknown"
+                            app_name = (data.get("App") or data.get("app") or "").lower()
+                            if app_name == "metascalp":
+                                version = data.get("Version") or data.get("version") or "unknown"
+                                self.metascalp_version = version
                                 self.logger.info(f"✅ MetaScalp найден на порту {port}, версия {version}")
                                 return port
             except:
@@ -837,58 +588,35 @@ class FundingArbitrageBot:
     async def _fetch_connection_ids(self) -> bool:
         if not self.metascalp_session:
             return False
-
         try:
-            async with self.metascalp_session.get(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections"
-            ) as resp:
+            async with self.metascalp_session.get(f"http://127.0.0.1:{self.metascalp_port}/api/connections") as resp:
                 if resp.status != 200:
                     return False
-
                 data = await resp.json()
                 connections = data.get('Connections', data.get('connections', []))
-
                 self.metascalp_connections.clear()
-
                 for conn in connections:
-                    exchange_name = conn['Exchange'].lower()
+                    ex_name = conn['Exchange'].lower()
                     market_type = conn['MarketType']
                     conn_id = conn['Id']
                     conn_state = conn['State']
                     view_mode = conn.get('ViewMode', False)
-
                     if conn_state != 2:
                         continue
-
-                    if exchange_name not in self.metascalp_connections:
-                        self.metascalp_connections[exchange_name] = {'view_mode': view_mode}
-                    else:
-                        self.metascalp_connections[exchange_name]['view_mode'] = (
-                            self.metascalp_connections[exchange_name].get('view_mode', True) and view_mode
-                        )
-
                     is_spot = market_type == 0
                     is_perp = market_type in (1, 2, 5)
-
+                    if ex_name not in self.metascalp_connections:
+                        self.metascalp_connections[ex_name] = {}
                     if is_spot:
-                        self.metascalp_connections[exchange_name]['spot_id'] = conn_id
-                        self.metascalp_connections[exchange_name]['spot_name'] = conn['Name']
-                        self.metascalp_connections[exchange_name]['spot_view_mode'] = view_mode
-                        if not view_mode:
-                            self.logger.info(f"   📗 {exchange_name.upper()} SPOT: ID={conn_id}")
+                        self.metascalp_connections[ex_name]['spot_id'] = conn_id
+                        self.metascalp_connections[ex_name]['spot_view_mode'] = view_mode
                     elif is_perp:
-                        self.metascalp_connections[exchange_name]['perp_id'] = conn_id
-                        self.metascalp_connections[exchange_name]['perp_name'] = conn['Name']
-                        self.metascalp_connections[exchange_name]['perp_view_mode'] = view_mode
-                        if not view_mode:
-                            self.logger.info(f"   📕 {exchange_name.upper()} PERP: ID={conn_id}")
-
-                if not self.metascalp_connections:
-                    self.logger.warning("Не найдено активных подключений")
-                    return False
-
-                return True
-
+                        self.metascalp_connections[ex_name]['perp_id'] = conn_id
+                        self.metascalp_connections[ex_name]['perp_view_mode'] = view_mode
+                    spot_vm = self.metascalp_connections[ex_name].get('spot_view_mode', True)
+                    perp_vm = self.metascalp_connections[ex_name].get('perp_view_mode', True)
+                    self.metascalp_connections[ex_name]['view_mode'] = spot_vm and perp_vm
+                return bool(self.metascalp_connections)
         except Exception as e:
             self.logger.error(f"❌ Ошибка получения подключений: {e}")
             return False
@@ -901,22 +629,58 @@ class FundingArbitrageBot:
             view_mode = " (ViewOnly)" if conns.get('view_mode', False) else ""
             self.logger.info(f"   • {ex_name.upper()}: Spot ID={spot_id}, Perp ID={perp_id}{view_mode}")
 
+    async def _update_metascalp_balances(self) -> None:
+        if not self.metascalp_session or self.metascalp_state != ConnectionState.CONNECTED:
+            return
+        now = time.time()
+        if now - self.last_balance_update < self.balance_update_interval:
+            return
+        self.last_balance_update = now
+        updated = 0
+        for ex_name, conns in self.metascalp_connections.items():
+            if conns.get('view_mode', False):
+                continue
+            for ct, ci in [('spot_id', conns.get('spot_id')), ('perp_id', conns.get('perp_id'))]:
+                if ci:
+                    try:
+                        async with self.metascalp_session.get(f"http://127.0.0.1:{self.metascalp_port}/api/connections/{ci}/balance") as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for b in data.get('balances', data.get('Balances', [])):
+                                    if b.get('Coin') == 'USDT':
+                                        self.metascalp_balances[ci] = float(b.get('Free', 0))
+                                        updated += 1
+                                        break
+                    except:
+                        pass
+        if updated:
+            self.logger.info(f"✅ Обновлено балансов: {updated}")
+
+    async def fetch_balances_direct(self, connection_id: int) -> Dict[str, float]:
+        """Прямой запрос баланса для конкретного подключения"""
+        try:
+            async with self.metascalp_session.get(
+                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{connection_id}/balance"
+            ) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json()
+                result = {}
+                for b in data.get('balances', data.get('Balances', [])):
+                    result[b.get('Coin', '')] = float(b.get('Free', 0))
+                return result
+        except:
+            return {}
+
     async def _check_metascalp_connection(self) -> None:
         now = time.time()
-        check_interval = self.config.get('metascalp_connection_check_interval', 60)
-
-        if now - self.last_metascalp_check < check_interval:
+        if now - self.last_metascalp_check < self.config.get('metascalp_connection_check_interval', 60):
             return
-
         self.last_metascalp_check = now
         await self._update_metascalp_balances()
-
         if self.metascalp_state == ConnectionState.CONNECTED:
             try:
-                async with self.metascalp_session.get(
-                    f"http://127.0.0.1:{self.metascalp_port}/ping",
-                    timeout=aiohttp.ClientTimeout(total=2)
-                ) as resp:
+                async with self.metascalp_session.get(f"http://127.0.0.1:{self.metascalp_port}/ping", timeout=aiohttp.ClientTimeout(total=2)) as resp:
                     if resp.status != 200:
                         raise Exception("Ping failed")
             except:
@@ -924,34 +688,26 @@ class FundingArbitrageBot:
                 self.metascalp_state = ConnectionState.DISCONNECTED
                 if not self.manual_test_mode:
                     self.auto_test_mode = True
-                    self.logger.warning("🔶 Включён АВТО-ТЕСТОВЫЙ режим")
-
         elif self.metascalp_state == ConnectionState.DISCONNECTED:
-            timeout = self.config.get('metascalp_reconnect_timeout', 30)
-            max_attempts = self.config.get('metascalp_max_reconnect_attempts', 10)
-
-            if self.metascalp_reconnect_attempts < max_attempts:
+            max_att = self.config.get('metascalp_max_reconnect_attempts', 10)
+            if self.metascalp_reconnect_attempts < max_att:
                 self.metascalp_reconnect_attempts += 1
-                self.logger.info(f"🔄 Попытка переподключения ({self.metascalp_reconnect_attempts}/{max_attempts})...")
-
+                self.logger.info(f"🔄 Переподключение ({self.metascalp_reconnect_attempts}/{max_att})...")
                 if await self._connect_metascalp():
                     self.logger.info("✅ Соединение восстановлено!")
                     self.auto_test_mode = False
-                    if not self.manual_test_mode:
-                        self.logger.info("🔄 Режим работы: ТОРГОВЛЯ")
             else:
                 self.metascalp_reconnect_attempts = 0
 
+    # ========================================================================
+    # CCXT
+    # ========================================================================
+
     async def _init_exchanges(self) -> None:
-        """Инициализация ТОЛЬКО активных бирж CCXT с повторными попытками при ошибках"""
-        active_exchanges = set(self.config.get('active_exchanges', []))
-        
+        active = set(self.config.get('active_exchanges', []))
         for ex_name in self.config['enabled_exchanges']:
-            if ex_name not in active_exchanges:
-                self.logger.debug(f"⏭️ Биржа {ex_name} не активна, пропускаем инициализацию")
+            if ex_name not in active:
                 continue
-                
-            success = False
             for attempt in range(3):
                 try:
                     exchange_class = getattr(ccxt, ex_name)
@@ -964,11 +720,10 @@ class FundingArbitrageBot:
                     self.exchanges[ex_name] = exchange
                     self.exchanges_online[ex_name] = True
                     self.logger.info(f"✅ Биржа {ex_name.upper()} инициализирована")
-                    success = True
                     break
                 except Exception as e:
                     if attempt < 2:
-                        self.logger.warning(f"⚠️ Попытка {attempt + 1} для {ex_name} не удалась, повтор через 5 сек...")
+                        self.logger.warning(f"⚠️ Попытка {attempt+1} для {ex_name} не удалась, повтор...")
                         await asyncio.sleep(5)
                     else:
                         self.exchanges_online[ex_name] = False
@@ -988,123 +743,450 @@ class FundingArbitrageBot:
             except:
                 self.exchanges_online[ex_name] = False
 
-    async def shutdown(self) -> None:
-        self.logger.info("🛑 Завершение работы бота...")
-        self.is_running = False
-        
-        self._save_open_positions()
+    async def initialize(self) -> None:
+        await self._init_exchanges()
+        await self._connect_metascalp()
+        self._load_open_positions()
+        await self._sync_positions_with_exchange()
+        self._load_instrument_cache_from_file()
 
+        if self.telegram_enabled:
+            from telegram_bot import TelegramManager
+            self.tg_manager = TelegramManager(self)
+            if self.tg_manager.enabled:
+                asyncio.create_task(self.tg_manager.start_bot())
+                self.logger.info("📱 Telegram Bot запущен")
+
+        for pos in self.positions:
+            if not pos.close_time:
+                result = await self._fetch_funding_rate(pos.perp_exchange, pos.symbol)
+                if result:
+                    self._last_current_rates[pos.symbol] = result[0]
+
+    async def shutdown(self) -> None:
+        self.logger.info("🛑 Завершение...")
+        self.is_running = False
+        self._save_open_positions()
+        self._save_instrument_cache_to_file()
+        if self.tg_manager:
+            await self.tg_manager.stop_bot()
         for ex in self.exchanges.values():
             await ex.close()
-
         if self.metascalp_session:
             await self.metascalp_session.close()
-
+        if self._http_session:
+            await self._http_session.close()
         self.logger.info("✅ Бот остановлен")
 
-    # ========================================================================
-    # Белый список и Fallback
-    # ========================================================================
-
-    def _load_whitelist(self) -> Set[str]:
-        whitelist_file = self.config.get('whitelist_file', 'whitelist.txt')
-        whitelist = set()
-
+    def _load_open_positions(self) -> None:
         try:
-            path = Path(whitelist_file)
+            path = Path(self.open_positions_file)
             if path.exists():
-                mtime = path.stat().st_mtime
-
-                if mtime != self.whitelist_mtime:
-                    with open(path, 'r') as f:
-                        for line in f:
-                            symbol = line.strip()
-                            if symbol:
-                                whitelist.add(symbol)
-
-                    self.whitelist_mtime = mtime
-                    self.logger.info(f"📋 Загружен белый список: {len(whitelist)} инструментов")
-
-                    age_hours = (time.time() - mtime) / 3600
-                    if age_hours > 25:
-                        self.logger.warning(f"⚠️ Белый список устарел ({age_hours:.1f} часов)")
-
-                    return whitelist
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                    for p in data:
+                        p.setdefault('entry_perp_price', 0.0)
+                        p.setdefault('funding_payments_received', 0.0)
+                        p.setdefault('funding_payments_count', 0)
+                        p.setdefault('last_funding_time', None)
+                        p.setdefault('close_in_progress', False)
+                        pos = Position(**p)
+                        self.positions.append(pos)
+                self.logger.info(f"📂 Загружено {len(self.positions)} открытых позиций из файла")
         except Exception as e:
-            self.logger.error(f"❌ Ошибка загрузки белого списка: {e}")
+            self.logger.error(f"❌ Ошибка загрузки открытых позиций: {e}")
 
-        return whitelist
+    def _save_open_positions(self) -> None:
+        try:
+            path = Path(self.open_positions_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            active = [asdict(p) for p in self.active_positions]
+            with open(path, 'w') as f:
+                json.dump(active, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка сохранения открытых позиций: {e}")
 
-    async def _get_fallback_symbols(self) -> Set[str]:
-        symbols = set()
-        active = set(self.config.get('active_exchanges', []))
-        
-        if len(active) < 1:
-            self.logger.warning("⚠️ Fallback: нет активных бирж в конфиге")
-            return symbols
+    async def _check_perp_position_exists(self, pos: Position) -> bool:
+        if pos.perp_exchange not in self.metascalp_connections:
+            return False
+        ci = self.metascalp_connections[pos.perp_exchange].get('perp_id')
+        if not ci:
+            return False
+        try:
+            async with self.metascalp_session.get(f"http://127.0.0.1:{self.metascalp_port}/api/connections/{ci}/positions") as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+                cs = pos.symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
+                for rp in data.get('Positions', []):
+                    if rp.get('Ticker') == cs:
+                        if pos.direction == 'BUY_SPOT_SHORT_PERP' and rp.get('Side') == 2:
+                            return True
+                        if pos.direction == 'SELL_SPOT_LONG_PERP' and rp.get('Side') == 1:
+                            return True
+                return False
+        except:
+            return False
 
-        fallback_priority = self.config.get('fallback_priority', [])
-        
-        selected_ex = None
-        
-        for ex in fallback_priority:
-            if ex in active and ex in self.exchanges:
-                if hasattr(self.exchanges[ex], 'markets') and self.exchanges[ex].markets:
-                    selected_ex = ex
-                    self.logger.debug(f"📋 Fallback: выбрана приоритетная биржа {ex}")
-                    break
-        
-        if not selected_ex:
-            for ex in active:
-                if ex in self.exchanges:
-                    if hasattr(self.exchanges[ex], 'markets') and self.exchanges[ex].markets:
-                        selected_ex = ex
-                        self.logger.debug(f"📋 Fallback: приоритетные биржи недоступны, выбрана {ex}")
-                        break
-        
-        if not selected_ex:
-            self.logger.warning("⚠️ Fallback: нет доступных бирж с загруженными рынками")
-            self.logger.info(f"   Активные биржи: {list(active)}")
-            self.logger.info(f"   Инициализированные: {list(self.exchanges.keys())}")
-            return symbols
+    async def _sync_positions_with_exchange(self) -> None:
+        if self.is_test_mode:
+            self.logger.info(f"🧪 Тестовый режим: {len(self.positions)} позиций")
+            return
+        self.logger.info("🔄 Синхронизация позиций...")
+        valid = []
+        for pos in self.positions:
+            if await self._check_perp_position_exists(pos):
+                valid.append(pos)
+                self.logger.info(f"   ✅ {pos.symbol} подтверждена")
+            else:
+                # Не удаляем, просто предупреждаем
+                self.logger.warning(f"   ⚠️ {pos.symbol} не найдена через API, но оставляем в списке")
+                valid.append(pos)  # ← добавляем в valid вместо удаления
+        self.positions = valid
+        self._save_open_positions()
+
+    # ========================================================================
+    # Персистентность кэша
+    # ========================================================================
+
+    def _save_instrument_cache_to_file(self) -> None:
+        try:
+            path = Path(self.cache_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                'timestamp': self.cache_last_updated,
+                'total_futures_found': self.cache_total_futures_found,
+                'filtered_by_profit': self.cache_filtered_by_profit,
+                'filtered_by_no_spot': self.cache_filtered_by_no_spot,
+                'filtered_by_status': self.cache_filtered_by_status,
+                'instruments': [item.to_dict() for item in self.instrument_cache]
+            }
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.logger.debug(f"💾 Кэш сохранён: {len(self.instrument_cache)} инструментов")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка сохранения кэша: {e}")
+
+    def _load_instrument_cache_from_file(self) -> None:
+        try:
+            path = Path(self.cache_file)
+            if not path.exists():
+                self.logger.info("📂 Файл кэша не найден, будет перестроен")
+                return
+            with open(path, 'r') as f:
+                data = json.load(f)
+            ts = data.get('timestamp', 0)
+            if ts < 1000000000:
+                self.logger.info("📂 Кэш повреждён (timestamp=0), будет перестроен")
+                return
+            age_minutes = (time.time() - ts) / 60
+            if age_minutes < self.cache_rebuild_interval:
+                self.instrument_cache = [CachedInstrument(**item) for item in data['instruments']]
+                self.cache_last_updated = ts
+                self.cache_total_futures_found = data.get('total_futures_found', 0)
+                self.cache_filtered_by_profit = data.get('filtered_by_profit', 0)
+                self.cache_filtered_by_no_spot = data.get('filtered_by_no_spot', 0)
+                self.cache_filtered_by_status = data.get('filtered_by_status', 0)
+                self.logger.info(f"📂 Кэш загружен: {len(self.instrument_cache)} инструментов (возраст {age_minutes:.0f} мин)")
+            else:
+                self.logger.info(f"📂 Кэш устарел ({age_minutes:.0f} мин), будет перестроен")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка загрузки кэша: {e}")
+
+    # ========================================================================
+    # Прямые HTTP-запросы
+    # ========================================================================
+
+    async def _fetch_funding_rates_direct(self, ex_name: str) -> Optional[List[dict]]:
+        if not self._http_session:
+            self._http_session = aiohttp.ClientSession()
+
+        endpoints = {
+            'mexc': {
+                'url': 'https://api.mexc.com/api/v1/contract/funding_rate',
+                'result_key': 'data',
+                'symbol_field': 'symbol',
+                'rate_field': 'fundingRate',
+                'time_field': 'nextSettleTime',
+                'symbol_transform': lambda s: s.replace('_', '/') + ':USDT',
+            },
+            'kucoin': {
+                'url': 'https://api-futures.kucoin.com/api/v1/contracts/active',
+                'result_key': 'data',
+                'symbol_field': 'symbol',
+                'rate_field': 'fundingFeeRate',
+                'time_field': 'nextFundingRateTime',
+                'symbol_transform': lambda s: s,
+            },
+            'bitmart': {
+                'url': 'https://api-cloud-v2.bitmart.com/contract/public/details',
+                'result_key': 'data.symbols',
+                'symbol_field': 'symbol',
+                'rate_field': 'funding_rate',
+                'time_field': 'funding_time',
+                'symbol_transform': lambda s: s + '/USDT:USDT' if s.endswith('USDT') else s,
+            },
+        }
+
+        cfg = endpoints.get(ex_name)
+        if not cfg:
+            return None
 
         try:
-            count = 0
-            for symbol, market in self.exchanges[selected_ex].markets.items():
-                if symbol.endswith('/USDT') and market.get('active', False):
-                    base = symbol.split('/')[0]
-                    symbols.add(base)
-                    count += 1
-            
-            full_symbols = {f"{s}/USDT:USDT" for s in symbols}
-            
-            if self.scan_count % 10 == 0 or self.scan_count == 1:
-                self.logger.info(f"📋 Fallback: биржа {selected_ex} → {len(full_symbols)} инструментов")
-            else:
-                self.logger.debug(f"📋 Fallback: биржа {selected_ex} → {len(full_symbols)} инструментов")
-            
-            if len(full_symbols) == 0:
-                self.logger.warning(f"⚠️ Fallback: биржа {selected_ex} не вернула ни одной активной USDT-пары!")
-                
-            return full_symbols
-            
+            async with self._http_session.get(cfg['url'], timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+
+            items = data
+            for key in cfg['result_key'].split('.'):
+                if isinstance(items, dict):
+                    items = items.get(key, [])
+                else:
+                    break
+
+            if not isinstance(items, list):
+                return None
+
+            result = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                raw_symbol = item.get(cfg['symbol_field'], '')
+                if not raw_symbol:
+                    continue
+                symbol = cfg['symbol_transform'](raw_symbol)
+                rate = item.get(cfg['rate_field'])
+                if rate is None:
+                    continue
+                next_time = item.get(cfg['time_field'], 0)
+                if next_time and next_time > 1000000000000:
+                    next_time = next_time / 1000
+                result.append({
+                    'symbol': symbol,
+                    'rate': float(rate),
+                    'next_funding_time': next_time if next_time else None,
+                    'exchange': ex_name,
+                })
+            if result:
+                self.logger.info(f"📊 {ex_name}: прямой запрос → {len(result)} фьючерсов")
+                return result
         except Exception as e:
-            self.logger.error(f"❌ Fallback: ошибка получения рынков с {selected_ex}: {e}")
-            return symbols
+            self.logger.debug(f"⚠️ {ex_name}: прямой запрос не сработал ({type(e).__name__})")
+        return None
 
     # ========================================================================
-    # Комиссии и ликвидность
+    # Уровень 0: Построение кэша
     # ========================================================================
+
+    async def _fetch_futures_for_exchange(self, ex_name: str) -> List[dict]:
+        exchange = self.exchanges.get(ex_name)
+        if not exchange:
+            return []
+
+        direct_result = await self._fetch_funding_rates_direct(ex_name)
+        if direct_result:
+            return direct_result
+
+        try:
+            raw_rates = await exchange.fetch_funding_rates()
+            if raw_rates:
+                result = []
+                items = raw_rates.values() if isinstance(raw_rates, dict) else raw_rates
+                for r in items:
+                    if not isinstance(r, dict):
+                        continue
+                    symbol = r.get('symbol', '')
+                    if not symbol:
+                        continue
+                    if ':USDT' not in symbol and ':USDC' not in symbol:
+                        if '/USDT' in symbol:
+                            symbol = symbol + ':USDT'
+                        elif '/USDC' in symbol:
+                            symbol = symbol + ':USDC'
+                        else:
+                            continue
+                    rate_value = r.get('fundingRate')
+                    if rate_value is None:
+                        continue
+                    result.append({
+                        'symbol': symbol,
+                        'rate': float(rate_value),
+                        'next_funding_time': r.get('fundingTimestamp', 0) / 1000 if r.get('fundingTimestamp') else None,
+                        'exchange': ex_name,
+                    })
+                if result:
+                    self.logger.info(f"📊 {ex_name}: CCXT быстрый → {len(result)} фьючерсов")
+                    return result
+        except:
+            pass
+
+        self.logger.warning(f"⚠️ {ex_name}: не удалось получить фьючерсы, пропускаем")
+        return []
+
+    def _calculate_preliminary_profit(self, rate: float) -> float:
+        if rate is None:
+            return 0.0
+        expected_bps = abs(rate) * 10000
+        if self.deduct_fees_from_profit:
+            min_spot_fee = self.manual_spot_fee_pct / 100.0
+            min_perp_fee = self.manual_futures_fee_pct / 100.0
+            total_fee_pct = (min_spot_fee + min_perp_fee) * 2 * 100
+            return expected_bps - (total_fee_pct * 100)
+        return expected_bps
+
+    def _find_spot_market(self, exchange_name: str, perp_symbol: str) -> Optional[str]:
+        exchange = self.exchanges.get(exchange_name)
+        if not exchange:
+            return None
+        base = perp_symbol.split('/')[0]
+        spot_symbols_to_try = [f"{base}/USDT", f"{base}/USDC"]
+        if self.normalize_symbols:
+            if base.startswith('1000'):
+                spot_symbols_to_try.append(f"{base[4:]}/USDT")
+            match = re.match(r'^(\d+)([A-Z].*)$', base)
+            if match:
+                spot_symbols_to_try.append(f"{match.group(2)}/USDT")
+        for sym in spot_symbols_to_try:
+            try:
+                market = exchange.market(sym)
+                if market.get('active', False) and market.get('spot', False):
+                    return sym
+            except:
+                continue
+        return None
+
+    def _has_spot_connection(self, ex_name: str) -> bool:
+        if self.is_test_mode:
+            return ex_name in self.exchanges
+        conns = self.metascalp_connections.get(ex_name, {})
+        return 'spot_id' in conns and not conns.get('spot_view_mode', True)
+
+    def _has_perp_connection(self, ex_name: str) -> bool:
+        if self.is_test_mode:
+            return ex_name in self.exchanges
+        conns = self.metascalp_connections.get(ex_name, {})
+        return 'perp_id' in conns and not conns.get('perp_view_mode', True)
+
+    async def _rebuild_instrument_cache(self) -> None:
+        self.logger.info("🔄 [Уровень 0] Перестроение кэша...")
+        start_time = time.time()
+
+        all_futures = []
+        active_exchanges = set(self.config.get('active_exchanges', []))
+        for ex_name in active_exchanges:
+            if not self._has_perp_connection(ex_name):
+                continue
+            futures = await self._fetch_futures_for_exchange(ex_name)
+            all_futures.extend(futures)
+
+        self.cache_total_futures_found = len(all_futures)
+        self.logger.info(f"📊 Всего собрано фьючерсов: {len(all_futures)}")
+
+        profitable = []
+        self.cache_filtered_by_profit = 0
+        for f in all_futures:
+            profit_bps = self._calculate_preliminary_profit(f['rate'])
+            if profit_bps >= self.min_profit_bps:
+                f['preliminary_profit_bps'] = profit_bps
+                profitable.append(f)
+            else:
+                self.cache_filtered_by_profit += 1
+        self.logger.info(f"💰 После фильтра прибыли: {len(profitable)} (отсеяно {self.cache_filtered_by_profit})")
+
+        profitable.sort(key=lambda x: x['preliminary_profit_bps'], reverse=True)
+
+        if self.cache_max_instruments > 0 and len(profitable) > self.cache_max_instruments:
+            profitable = profitable[:self.cache_max_instruments]
+            self.logger.info(f"📦 Ограничение кэша: {len(profitable)}")
+
+        new_cache = []
+        self.cache_filtered_by_no_spot = 0
+        for f in profitable:
+            perp_ex = f['exchange']
+            spot_found = None
+            if self._has_spot_connection(perp_ex):
+                sm = self._find_spot_market(perp_ex, f['symbol'])
+                if sm:
+                    spot_found = perp_ex
+            if not spot_found:
+                for spot_ex in active_exchanges:
+                    if spot_ex == perp_ex:
+                        continue
+                    if not self._has_spot_connection(spot_ex):
+                        continue
+                    sm = self._find_spot_market(spot_ex, f['symbol'])
+                    if sm:
+                        spot_found = spot_ex
+                        break
+            if spot_found:
+                new_cache.append(CachedInstrument(
+                    symbol=f['symbol'],
+                    spot_exchange=spot_found,
+                    perp_exchange=perp_ex,
+                    funding_rate=f['rate'],
+                    preliminary_profit_bps=f['preliminary_profit_bps'],
+                ))
+            else:
+                self.cache_filtered_by_no_spot += 1
+
+        self.logger.info(f"🔗 После поиска спота: {len(new_cache)} (отсеяно {self.cache_filtered_by_no_spot})")
+
+        if self.check_trading_status:
+            semaphore = asyncio.Semaphore(self.max_concurrent_cache_requests)
+            self.cache_filtered_by_status = 0
+
+            async def check_one(item):
+                async with semaphore:
+                    try:
+                        pe = self.exchanges.get(item.perp_exchange)
+                        se = self.exchanges.get(item.spot_exchange)
+                        if not pe or not se:
+                            return None
+                        pm = pe.market(item.symbol)
+                        ss = item.symbol.replace(':USDT', '')
+                        sm = se.market(ss)
+                        if pm.get('active', False) and sm.get('active', False):
+                            return item
+                        return None
+                    except:
+                        return None
+
+            tasks = [check_one(item) for item in new_cache]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            valid_count = sum(1 for r in results if isinstance(r, CachedInstrument))
+            self.cache_filtered_by_status = len(new_cache) - valid_count
+            new_cache = [r for r in results if isinstance(r, CachedInstrument)]
+            self.logger.info(f"🔒 После статуса: {len(new_cache)} (отсеяно {self.cache_filtered_by_status})")
+
+        self.instrument_cache = new_cache
+        self.cache_last_updated = time.time()
+        self._save_instrument_cache_to_file()
+
+        elapsed = time.time() - start_time
+        self.logger.info(f"✅ [Уровень 0] Кэш готов: {len(new_cache)} комбинаций за {elapsed:.1f} сек")
+
+    # ========================================================================
+    # Уровень 1
+    # ========================================================================
+
+    async def _fetch_funding_rate(self, exchange_name: str, symbol: str) -> Optional[Tuple[float, float]]:
+        exchange = self.exchanges.get(exchange_name)
+        if not exchange:
+            return None
+        try:
+            ticker = await exchange.fetch_funding_rate(symbol)
+            return (ticker.get('fundingRate', 0.0), ticker.get('fundingTimestamp', 0) / 1000)
+        except:
+            return None
 
     async def _get_trading_fees(self, exchange_name: str, symbol: str, is_spot: bool) -> Optional[float]:
         cache = self.spot_fees_cache if is_spot else self.futures_fees_cache
         if exchange_name in cache and symbol in cache[exchange_name]:
             return cache[exchange_name][symbol]
-
         exchange = self.exchanges.get(exchange_name)
         if not exchange:
             return None
-
         fee = None
         if exchange.has.get('fetchTradingFees'):
             try:
@@ -1113,693 +1195,735 @@ class FundingArbitrageBot:
                     fee = fees[symbol].get('taker') or fees[symbol].get('maker')
             except:
                 pass
-
         if fee is None:
             try:
                 market = exchange.market(symbol)
                 fee = market.get('taker') or market.get('maker')
             except:
                 pass
-
         if fee is not None:
             if exchange_name not in cache:
                 cache[exchange_name] = {}
             cache[exchange_name][symbol] = fee
             return fee
-
         return self.manual_spot_fee_pct / 100.0 if is_spot else self.manual_futures_fee_pct / 100.0
 
-    async def _check_liquidity_filters(
-        self, 
-        spot_exchange: str, 
-        perp_exchange: str, 
-        symbol: str
-    ) -> Tuple[bool, float, float, float, float]:
+    def _is_price_mismatch(self, spot_price: float, perp_price: float, max_ratio: float = 5.0) -> bool:
+        if spot_price <= 0 or perp_price <= 0:
+            return False
+        ratio = max(spot_price, perp_price) / min(spot_price, perp_price)
+        return ratio > max_ratio
+
+    async def _check_liquidity_filters(self, spot_exchange: str, perp_exchange: str, symbol: str) -> Tuple[bool, float, float, float, float]:
         spot_ex = self.exchanges.get(spot_exchange)
         perp_ex = self.exchanges.get(perp_exchange)
-
         if not spot_ex or not perp_ex:
             return False, 0, 0, 0, 0
-
         try:
-            ex_symbol = symbol
-            if spot_exchange == 'binance' and not symbol.endswith('USDT'):
-                ex_symbol = f"{symbol}/USDT:USDT"
-
-            spot_ticker_task = spot_ex.fetch_ticker(ex_symbol.replace(':USDT', ''))
-            perp_ticker_task = perp_ex.fetch_ticker(ex_symbol)
-
-            spot_ticker, perp_ticker = await asyncio.gather(spot_ticker_task, perp_ticker_task)
-
-            spot_price = spot_ticker.get('last', 0)
-            perp_price = perp_ticker.get('last', 0)
-            volume_24h = spot_ticker.get('quoteVolume', 0) or 0
-
-            if volume_24h < self.min_volume_24h_usdt:
+            spot_sym = symbol.replace(':USDT', '')
+            spot_t, perp_t = await asyncio.gather(
+                spot_ex.fetch_ticker(spot_sym),
+                perp_ex.fetch_ticker(symbol)
+            )
+            sp = spot_t.get('last', 0)
+            pp = perp_t.get('last', 0)
+            sv = spot_t.get('quoteVolume', 0) or 0
+            pv = perp_t.get('quoteVolume', 0) or 0
+            if sv < self.min_volume_24h_usdt:
                 self.filtered_by_volume += 1
-                return False, volume_24h, 0, spot_price, perp_price
-
-            if spot_price > 0 and perp_price > 0:
-                spread_pct = abs(perp_price - spot_price) / spot_price * 100
-                if spread_pct > self.max_slippage_pct:
-                    self.filtered_by_spread += 1
-                    return False, volume_24h, spread_pct, spot_price, perp_price
-            else:
-                spread_pct = 0
-
-            return True, volume_24h, spread_pct, spot_price, perp_price
-
+                return False, sv, 0, sp, pp
+            if pv < self.min_volume_24h_usdt:
+                self.filtered_by_volume += 1
+                return False, pv, 0, sp, pp
+            if self._is_price_mismatch(sp, pp):
+                self.filtered_by_symbol_mismatch += 1
+                return False, sv, 0, sp, pp
+            spread = abs(pp - sp) / sp * 100 if sp > 0 else 0
+            if spread > self.max_slippage_pct:
+                self.filtered_by_spread += 1
+                return False, sv, spread, sp, pp
+            return True, sv, spread, sp, pp
         except:
             return False, 0, 0, 0, 0
 
-    # ========================================================================
-    # Сканирование
-    # ========================================================================
-
-    async def _fetch_funding_rate(self, exchange_name: str, symbol: str) -> Optional[Tuple[float, float]]:
-        exchange = self.exchanges.get(exchange_name)
-        if not exchange:
-            return None
-
-        try:
-            ex_symbol = symbol
-            if exchange_name == 'binance' and not symbol.endswith('USDT'):
-                ex_symbol = f"{symbol}/USDT:USDT"
-
-            ticker = await exchange.fetch_funding_rate(ex_symbol)
-            rate = ticker.get('fundingRate', 0.0)
-            next_time = ticker.get('fundingTimestamp', 0) / 1000
-
-            return (rate, next_time)
-        except:
-            return None
-
-    async def _scan_symbol(self, symbol: str, spot_ex: str, perp_ex: str) -> Optional[ArbitrageOpportunity]:
-        passes, volume_24h, spread_pct, spot_price, perp_price = await self._check_liquidity_filters(
-            spot_ex, perp_ex, symbol
+    async def _scan_symbol(self, item: CachedInstrument) -> Optional[ArbitrageOpportunity]:
+        passes, volume, spread, sp, pp = await self._check_liquidity_filters(
+            item.spot_exchange, item.perp_exchange, item.symbol
         )
         if not passes:
             return None
-
-        if self.config.get('check_trading_status', True):
-            try:
-                perp_market = self.exchanges[perp_ex].market(symbol)
-                spot_market = self.exchanges[spot_ex].market(symbol.replace(':USDT', ''))
-                if not perp_market.get('active', False) or not spot_market.get('active', False):
-                    self.filtered_by_status += 1
-                    return None
-            except:
-                pass
-
-        result = await self._fetch_funding_rate(perp_ex, symbol)
-        if result is None:
+        result = await self._fetch_funding_rate(item.perp_exchange, item.symbol)
+        if not result:
             return None
-
-        funding_rate, next_funding_time = result
-
-        if abs(funding_rate) < self.config.get('funding_rate_threshold', 0.0001):
+        rate, next_time = result
+        if abs(rate) < self.funding_rate_threshold:
+            self.filtered_by_rate_threshold += 1
             return None
-
-        min_time = self.config.get('min_time_to_funding_minutes', 0)
-        if min_time > 0 and next_funding_time:
-            time_to_funding = next_funding_time - time.time()
-            if time_to_funding < min_time * 60:
+        if self.min_time_to_funding_minutes > 0 and next_time:
+            ttf = next_time - time.time()
+            if ttf < self.min_time_to_funding_minutes * 60:
                 self.filtered_by_time += 1
-                self.logger.debug(f"⏰ {symbol} отфильтрован: до выплаты {time_to_funding/60:.0f} мин < {min_time} мин")
                 return None
-
-        if funding_rate > 0:
-            expected_profit_bps = funding_rate * 10000
+        if rate > 0:
+            expected_bps = rate * 10000
             direction = "LONG_SPOT_SHORT_PERP"
         else:
-            expected_profit_bps = abs(funding_rate) * 10000
+            expected_bps = abs(rate) * 10000
             direction = "SHORT_SPOT_LONG_PERP"
-
-        if direction == "SHORT_SPOT_LONG_PERP" and not self.config.get('margin_enabled', False):
+        if direction == "SHORT_SPOT_LONG_PERP" and not self.margin_enabled:
             self.filtered_by_margin += 1
             return None
-
         spot_fee_pct = 0.0
         perp_fee_pct = 0.0
-        net_profit_bps = expected_profit_bps
-
-        if self.config.get('deduct_fees_from_profit', True):
-            spot_fee_rate = await self._get_trading_fees(spot_ex, symbol, is_spot=True)
-            perp_fee_rate = await self._get_trading_fees(perp_ex, symbol, is_spot=False)
-
-            if spot_fee_rate is not None and perp_fee_rate is not None:
-                spot_fee_pct = spot_fee_rate * 100
-                perp_fee_pct = perp_fee_rate * 100
-                total_fee_percent = (spot_fee_rate + perp_fee_rate) * 2 * 100
-                net_profit_bps = expected_profit_bps - (total_fee_percent * 100)
-
-                min_profit = self.config.get('min_profit_bps', 10)
-                if net_profit_bps < min_profit:
+        net_bps = expected_bps
+        if self.deduct_fees_from_profit:
+            sfr = await self._get_trading_fees(item.spot_exchange, item.symbol, is_spot=True)
+            pfr = await self._get_trading_fees(item.perp_exchange, item.symbol, is_spot=False)
+            if sfr is not None and pfr is not None:
+                spot_fee_pct = sfr * 100
+                perp_fee_pct = pfr * 100
+                total_fee_pct = (sfr + pfr) * 2 * 100
+                net_bps = expected_bps - (total_fee_pct * 100)
+                if net_bps < self.min_profit_bps:
                     self.filtered_by_fees += 1
                     return None
-
         return ArbitrageOpportunity(
-            timestamp=time.time(),
-            symbol=symbol,
-            spot_exchange=spot_ex,
-            perp_exchange=perp_ex,
-            funding_rate=funding_rate,
-            expected_profit_bps=expected_profit_bps,
-            spot_price=spot_price,
-            perp_price=perp_price,
-            direction=direction,
-            next_funding_time=next_funding_time,
-            volume_24h_usdt=volume_24h,
-            spread_pct=spread_pct,
-            spot_fee_pct=spot_fee_pct,
-            perp_fee_pct=perp_fee_pct,
-            net_profit_bps=net_profit_bps
+            timestamp=time.time(), symbol=item.symbol,
+            spot_exchange=item.spot_exchange, perp_exchange=item.perp_exchange,
+            funding_rate=rate, expected_profit_bps=expected_bps,
+            spot_price=sp, perp_price=pp, direction=direction,
+            next_funding_time=next_time, volume_24h_usdt=volume,
+            spread_pct=spread, spot_fee_pct=spot_fee_pct,
+            perp_fee_pct=perp_fee_pct, net_profit_bps=net_bps
         )
 
-    async def _scan_all_opportunities(self, symbols: Set[str]) -> List[ArbitrageOpportunity]:
-        tasks = []
-        active_exchanges = set(self.config.get('active_exchanges', []))
-
-        for symbol in symbols:
-            for pair in self.config.get('exchange_pairs', []):
-                spot_ex = pair['spot']
-                perp_ex = pair['perp']
-
-                if spot_ex not in active_exchanges or perp_ex not in active_exchanges:
-                    continue
-
-                if not self.is_test_mode:
-                    if spot_ex not in self.metascalp_connections or 'spot_id' not in self.metascalp_connections[spot_ex]:
-                        continue
-                    if perp_ex not in self.metascalp_connections or 'perp_id' not in self.metascalp_connections[perp_ex]:
-                        continue
-
-                if spot_ex in self.exchanges and perp_ex in self.exchanges:
-                    tasks.append(self._scan_symbol(symbol, spot_ex, perp_ex))
-
+    async def _scan_cached_opportunities(self) -> List[ArbitrageOpportunity]:
+        if not self.instrument_cache:
+            return []
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        async def bounded(item):
+            async with semaphore:
+                return await self._scan_symbol(item)
+        tasks = [bounded(item) for item in self.instrument_cache]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        opportunities = []
-        for r in results:
-            if isinstance(r, ArbitrageOpportunity):
-                opportunities.append(r)
-
-        return opportunities
+        return [r for r in results if isinstance(r, ArbitrageOpportunity)]
 
     # ========================================================================
     # Условия входа и выхода
     # ========================================================================
 
     def should_buy_spot_short_perp(self, opp: ArbitrageOpportunity) -> bool:
-        is_profitable = opp.net_profit_bps >= self.config.get('min_profit_bps', 10)
-        is_repeat = self.last_strategy_action == StrategyAction.BUY_SPOT_SHORT_PERP
-        correct_direction = opp.funding_rate > 0
-        return is_profitable and not is_repeat and correct_direction
+        return opp.net_profit_bps >= self.min_profit_bps and opp.funding_rate > 0
 
     def should_sell_spot_long_perp(self, opp: ArbitrageOpportunity) -> bool:
-        if not self.config.get('margin_enabled', False):
+        if not self.margin_enabled:
             return False
-        is_profitable = opp.net_profit_bps >= self.config.get('min_profit_bps', 10)
-        is_repeat = self.last_strategy_action == StrategyAction.SELL_SPOT_LONG_PERP
-        correct_direction = opp.funding_rate < 0
-        return is_profitable and not is_repeat and correct_direction
+        return opp.net_profit_bps >= self.min_profit_bps and opp.funding_rate < 0
 
     async def can_buy_spot_short_perp(self, opp: ArbitrageOpportunity) -> bool:
         if self.is_test_mode:
             return True
-
-        spot_conn_id = self.metascalp_connections.get(opp.spot_exchange, {}).get('spot_id')
-        perp_conn_id = self.metascalp_connections.get(opp.perp_exchange, {}).get('perp_id')
-
-        if not spot_conn_id or not perp_conn_id:
-            self.logger.debug(f"❌ Нет ID подключений для {opp.spot_exchange} или {opp.perp_exchange}")
+        sc = self.metascalp_connections.get(opp.spot_exchange, {}).get('spot_id')
+        pc = self.metascalp_connections.get(opp.perp_exchange, {}).get('perp_id')
+        self.logger.info(f"🔍 Проверка баланса: spot_id={sc} (type={type(sc).__name__}), perp_id={pc} (type={type(pc).__name__})")
+        self.logger.info(f"🔍 Доступные балансы: {list(self.metascalp_balances.keys())[:5]}")
+        self.logger.info(f"🔍 spot_bal={self.metascalp_balances.get(sc, 'N/A')}, perp_bal={self.metascalp_balances.get(pc, 'N/A')}")
+        if not sc:
+            self.logger.info(f"❌ Нет spot подключения для {opp.spot_exchange}")
             return False
-
-        spot_balance = self.metascalp_balances.get(spot_conn_id, 0)
-        perp_balance = self.metascalp_balances.get(perp_conn_id, 0)
-
-        required = self.base_order_amount
-        
-        if spot_balance < required:
-            self.logger.info(f"❌ Недостаточно баланса на споте {opp.spot_exchange}: {spot_balance:.2f} < {required:.2f} USDT")
+        if not pc:
+            self.logger.info(f"❌ Нет perp подключения для {opp.perp_exchange}")
             return False
-        
-        if perp_balance < required * 0.1:
-            self.logger.info(f"❌ Недостаточно маржи на перпе {opp.perp_exchange}: {perp_balance:.2f} < {required * 0.1:.2f} USDT")
+        spot_bal = self.metascalp_balances.get(sc, 0)
+        perp_bal = self.metascalp_balances.get(pc, 0)
+        if spot_bal < self.base_order_amount:
+            self.logger.info(f"❌ Недостаточно баланса спот {opp.spot_exchange}: {spot_bal:.2f} < {self.base_order_amount} USDT")
             return False
-        
+        if perp_bal < self.base_order_amount * 0.1:
+            self.logger.info(f"❌ Недостаточно баланса перп {opp.perp_exchange}: {perp_bal:.2f} < {self.base_order_amount * 0.1:.2f} USDT")
+            return False
         return True
 
     async def can_sell_spot_long_perp(self, opp: ArbitrageOpportunity) -> bool:
         if self.is_test_mode:
             return True
-
-        spot_conn_id = self.metascalp_connections.get(opp.spot_exchange, {}).get('spot_id')
-        perp_conn_id = self.metascalp_connections.get(opp.perp_exchange, {}).get('perp_id')
-
-        if not spot_conn_id or not perp_conn_id:
-            self.logger.debug(f"❌ Нет ID подключений для {opp.spot_exchange} или {opp.perp_exchange}")
+        sc = self.metascalp_connections.get(opp.spot_exchange, {}).get('spot_id')
+        pc = self.metascalp_connections.get(opp.perp_exchange, {}).get('perp_id')
+        if not sc:
+            self.logger.info(f"❌ Нет spot подключения для {opp.spot_exchange}")
             return False
-
-        spot_balance = self.metascalp_balances.get(spot_conn_id, 0)
-        perp_balance = self.metascalp_balances.get(perp_conn_id, 0)
-
-        required = self.base_order_amount
-        
-        if spot_balance < required:
-            self.logger.info(f"❌ Недостаточно баланса на споте {opp.spot_exchange}: {spot_balance:.2f} < {required:.2f} USDT")
+        if not pc:
+            self.logger.info(f"❌ Нет perp подключения для {opp.perp_exchange}")
             return False
-        
-        if perp_balance < required * 0.1:
-            self.logger.info(f"❌ Недостаточно маржи на перпе {opp.perp_exchange}: {perp_balance:.2f} < {required * 0.1:.2f} USDT")
+        spot_bal = self.metascalp_balances.get(sc, 0)
+        perp_bal = self.metascalp_balances.get(pc, 0)
+        if spot_bal < self.base_order_amount:
+            self.logger.info(f"❌ Недостаточно баланса спот {opp.spot_exchange}: {spot_bal:.2f} < {self.base_order_amount} USDT")
             return False
-        
+        if perp_bal < self.base_order_amount * 0.1:
+            self.logger.info(f"❌ Недостаточно баланса перп {opp.perp_exchange}: {perp_bal:.2f} < {self.base_order_amount * 0.1:.2f} USDT")
+            return False
         return True
 
+    def _check_liquidation_risk(self, pos: Position) -> bool:
+        if not pos.entry_perp_price or pos.entry_perp_price <= 0:
+            return False
+        current_price = self._last_perp_prices.get(pos.symbol, 0)
+        if current_price <= 0:
+            return False
+        change_pct = (current_price - pos.entry_perp_price) / pos.entry_perp_price * 100
+        if pos.direction == 'BUY_SPOT_SHORT_PERP' and change_pct >= self.max_price_change_pct:
+            return True
+        if pos.direction == 'SELL_SPOT_LONG_PERP' and change_pct <= -self.max_price_change_pct:
+            return True
+        return False
+
     async def _check_close_condition(self, pos: Position, current_rate: float) -> Tuple[bool, Optional[ExitReason]]:
-        """Проверка условия закрытия с уже известной ставкой"""
-        entry_rate = pos.entry_funding_rate
-        if (entry_rate > 0 and current_rate < 0) or (entry_rate < 0 and current_rate > 0):
-            self.logger.info(f"🔄 Ставка сменила знак для {pos.symbol}: {entry_rate*100:.4f}% → {current_rate*100:.4f}%")
+        er = pos.entry_funding_rate
+        if (er > 0 and current_rate < 0) or (er < 0 and current_rate > 0):
             return True, ExitReason.FUNDING_RATE_SIGN_CHANGED
-
-        max_age = self.config.get('max_position_age_hours', 24) * 3600
-        position_age = self.current_timestamp - pos.entry_time
-        if position_age > max_age:
-            self.logger.info(f"⏱️ Достигнуто максимальное время удержания для {pos.symbol}")
+        if self.max_position_age_hours == 0 and pos.next_funding_time:
+            if self.current_timestamp >= pos.next_funding_time + self.post_funding_close_delay * 60:
+                return True, ExitReason.FIRST_FUNDING_PAID
+        if self._check_liquidation_risk(pos):
+            change_pct = abs(self._last_perp_prices.get(pos.symbol, 0) - pos.entry_perp_price) / pos.entry_perp_price * 100
+            self.logger.warning(f"⚠️ Риск ликвидации для {pos.symbol}: цена изменилась на {change_pct:.1f}%")
+            if self.tg_manager:
+                await self.tg_manager.notify(
+                    f"⚠️ Риск ликвидации! {pos.symbol}: цена изменилась на {change_pct:.1f}%\n"
+                    f"Позиция будет закрыта."
+                )
+            return True, ExitReason.LIQUIDATION_RISK
+        max_age = self.max_position_age_hours * 3600
+        if max_age > 0 and self.current_timestamp - pos.entry_time > max_age:
             return True, ExitReason.MAX_POSITION_AGE
-
         return False, None
 
     # ========================================================================
     # Расчёт PnL
     # ========================================================================
 
-    async def _calculate_simulated_pnl(self, pos: Position) -> float:
-        result = await self._fetch_funding_rate(pos.perp_exchange, pos.symbol)
-
-        if not result:
+    async def _get_real_funding_payments(self, pos: Position) -> float:
+        """Получает реальные выплаты фондирования через CCXT (для Binance/Bybit)"""
+        if self.is_test_mode:
             return 0.0
-
-        current_rate, _ = result
-
-        spot_fee_rate = await self._get_trading_fees(pos.spot_exchange, pos.symbol, is_spot=True) or 0.001
-        perp_fee_rate = await self._get_trading_fees(pos.perp_exchange, pos.symbol, is_spot=False) or 0.0005
-
-        holding_hours = (self.current_timestamp - pos.entry_time) / 3600
-
-        avg_rate = (abs(pos.entry_funding_rate) + abs(current_rate)) / 2
-        funding_profit = pos.size_usdt * avg_rate * (holding_hours / 8)
-
-        total_fee = pos.size_usdt * (spot_fee_rate + perp_fee_rate) * 2
-
-        net_pnl = funding_profit - total_fee
-
-        pos.spot_entry_fee = pos.size_usdt * spot_fee_rate
-        pos.perp_entry_fee = pos.size_usdt * perp_fee_rate
-        pos.spot_exit_fee = pos.size_usdt * spot_fee_rate
-        pos.perp_exit_fee = pos.size_usdt * perp_fee_rate
-
-        return net_pnl
-
-    async def _get_real_fees_from_metascalp(self, connection_id: int, order_id: str) -> float:
         try:
-            async with self.metascalp_session.get(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{connection_id}/orders"
-            ) as resp:
-                if resp.status != 200:
-                    return 0.0
-                data = await resp.json()
-                orders = data.get('Orders', [])
-                for order in orders:
-                    if order.get('ClientId') == order_id or str(order.get('Id')) == order_id:
-                        return float(order.get('Fee', 0))
-            return 0.0
-        except:
-            return 0.0
-
-    async def _get_real_funding_payments(self, exchange: str, symbol: str, since: float) -> float:
-        try:
-            ex = self.exchanges.get(exchange)
-            if not ex:
+            exchange = self.exchanges.get(pos.perp_exchange)
+            if not exchange or not exchange.has.get('fetchFundingHistory'):
                 return 0.0
-
-            funding_history = await ex.fetch_funding_history(symbol, since=int(since * 1000))
-
-            total_funding = 0.0
-            for payment in funding_history:
-                total_funding += payment.get('amount', 0)
-
-            return total_funding
+            since_ms = int(pos.entry_time * 1000)
+            history = await exchange.fetch_funding_history(pos.symbol, since=since_ms)
+            total = 0.0
+            for payment in history:
+                total += payment.get('amount', 0.0)
+            return total
         except:
-            result = await self._fetch_funding_rate(exchange, symbol)
-            if result:
-                current_rate, _ = result
-                avg_rate = (abs(self.position.entry_funding_rate) + abs(current_rate)) / 2
-                holding_hours = (self.current_timestamp - since) / 3600
-                return self.position.size_usdt * avg_rate * (holding_hours / 8)
             return 0.0
 
-    async def _calculate_real_pnl(self, pos: Position) -> float:
-        spot_entry_fee = 0.0
-        perp_entry_fee = 0.0
+    async def _calculate_simulated_pnl(self, pos: Position) -> float:
+        # 1. Уже зафиксированные выплаты
+        received = pos.funding_payments_received
 
-        if pos.spot_order_id:
-            spot_conn_id = self.metascalp_connections[pos.spot_exchange]['spot_id']
-            spot_entry_fee = await self._get_real_fees_from_metascalp(spot_conn_id, pos.spot_order_id)
+        # 2. В реальном режиме — получаем реальные выплаты
+        if not self.is_test_mode:
+            real_payments = await self._get_real_funding_payments(pos)
+            if real_payments != 0.0:
+                received = real_payments
 
-        if pos.perp_order_id:
-            perp_conn_id = self.metascalp_connections[pos.perp_exchange]['perp_id']
-            perp_entry_fee = await self._get_real_fees_from_metascalp(perp_conn_id, pos.perp_order_id)
+        # 3. Доход с последней выплаты до сейчас
+        current_rate = self._last_current_rates.get(pos.symbol, pos.entry_funding_rate)
+        last_time = pos.last_funding_time or pos.entry_time
+        hours_since_last = max(0, (self.current_timestamp - last_time) / 3600)
+        pending = abs(current_rate) * pos.size_usdt * (hours_since_last / 8)
 
-        pos.spot_entry_fee = spot_entry_fee
-        pos.perp_entry_fee = perp_entry_fee
+        # 4. Комиссии
+        sfr = await self._get_trading_fees(pos.spot_exchange, pos.symbol, True) or 0.001
+        pfr = await self._get_trading_fees(pos.perp_exchange, pos.symbol, False) or 0.0005
 
-        actual_funding = await self._get_real_funding_payments(
-            pos.perp_exchange,
-            pos.symbol,
-            pos.entry_time
-        )
+        pos.spot_entry_fee = pos.size_usdt * sfr
+        pos.perp_entry_fee = pos.size_usdt * pfr
+        pos.spot_exit_fee = pos.size_usdt * sfr
+        pos.perp_exit_fee = pos.size_usdt * pfr
 
-        total_pnl = actual_funding - spot_entry_fee - perp_entry_fee
+        tf = pos.size_usdt * (sfr + pfr) * 2
 
-        if hasattr(pos, 'spot_exit_fee'):
-            total_pnl -= pos.spot_exit_fee
-        if hasattr(pos, 'perp_exit_fee'):
-            total_pnl -= pos.perp_exit_fee
+        return received + pending - tf
 
-        return total_pnl
+    # ========================================================================
+    # Форматирование тикеров и размеров
+    # ========================================================================
+
+    def _format_ticker_for_exchange(self, symbol: str, exchange: str) -> str:
+        """Форматирует тикер в зависимости от биржи"""
+        slash_exchanges = {'gate', 'kucoin', 'hyperliquid', 'lighter'}
+        underscore_exchanges = {'mexc', 'bitmart', 'lbank', 'xt'}
+        
+        if exchange in slash_exchanges:
+            return symbol.replace(':USDT', '')
+        elif exchange in underscore_exchanges:
+            return symbol.replace('/USDT:USDT', '_USDT')
+        else:
+            return symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
+
+    def _round_size_for_exchange(self, size: float, exchange: str, price: float) -> float:
+        """Округляет размер ордера согласно требованиям биржи"""
+        # Gate spot — целое число, min 1
+        if exchange == 'gate' and price > 1:
+            size = float(int(size))
+            if size < 1:
+                size = 1.0
+            return size
+        
+        # Gate perp — кратно 100
+        if exchange == 'gate':
+            size = float(int(size / 100) * 100)
+            if size < 100:
+                size = 100.0
+            return size
+        
+        # Binance spot — 4 знака
+        if exchange == 'binance' and price > 1:
+            return round(size, 4)
+        
+        # Binance perp — целое
+        if exchange == 'binance':
+            size = float(int(size))
+            if size < 1:
+                size = 1.0
+            return size
+        
+        # По умолчанию
+        if size < 1:
+            return round(size, 6)
+        return float(int(size))
 
     # ========================================================================
     # Исполнение сделок
     # ========================================================================
 
     async def execute_buy_spot_short_perp(self, opp: ArbitrageOpportunity) -> bool:
-        self.logger.info(f"📈 LONG SPOT + SHORT PERP: {opp.symbol} (прибыль: {opp.net_profit_bps:.1f} bps)")
-
+        self.logger.info(f"📈 LONG SPOT + SHORT PERP: {opp.symbol} ({opp.net_profit_bps:.1f} bps)")
         if self.is_test_mode:
-            pos = Position(
-                symbol=opp.symbol,
-                spot_exchange=opp.spot_exchange,
-                perp_exchange=opp.perp_exchange,
-                direction='BUY_SPOT_SHORT_PERP',
-                entry_time=self.current_timestamp,
-                entry_funding_rate=opp.funding_rate,
-                size_usdt=self.base_order_amount,
-                spot_filled=True,
-                perp_filled=True,
-                next_funding_time=opp.next_funding_time,
-                leverage=self.leverage
-            )
+            sfr = await self._get_trading_fees(opp.spot_exchange, opp.symbol, is_spot=True) or (self.manual_spot_fee_pct / 100.0)
+            pfr = await self._get_trading_fees(opp.perp_exchange, opp.symbol, is_spot=False) or (self.manual_futures_fee_pct / 100.0)
+            pos = Position(symbol=opp.symbol, spot_exchange=opp.spot_exchange, perp_exchange=opp.perp_exchange,
+                          direction='BUY_SPOT_SHORT_PERP', entry_time=self.current_timestamp,
+                          entry_funding_rate=opp.funding_rate, size_usdt=self.base_order_amount,
+                          spot_filled=True, perp_filled=True, next_funding_time=opp.next_funding_time,
+                          leverage=self.leverage, entry_perp_price=opp.perp_price,
+                          spot_entry_fee=self.base_order_amount * sfr,
+                          perp_entry_fee=self.base_order_amount * pfr,
+                          spot_exit_fee=self.base_order_amount * sfr,
+                          perp_exit_fee=self.base_order_amount * pfr)
             self.positions.append(pos)
             self._save_open_positions()
             self._last_current_rates[opp.symbol] = opp.funding_rate
-            self.last_strategy_action = StrategyAction.BUY_SPOT_SHORT_PERP
-            self.logger.info(f"🧪 [ТЕСТ] Позиция симулирована (всего открыто: {len(self.active_positions)})")
+            self._last_perp_prices[opp.symbol] = opp.perp_price
+            self.logger.info(f"🧪 [ТЕСТ] Позиция открыта (всего: {len(self.active_positions)})")
+            if self.tg_manager:
+                await self.tg_manager.notify(
+                    f"📈 Открыта BUY позиция: {pos.symbol} ({pos.spot_exchange}/{pos.perp_exchange})\n"
+                    f"Ставка: {pos.entry_funding_rate*100:.4f}% | Прибыль: {opp.net_profit_bps:.1f} bps"
+                )
             return True
-        else:
-            return await self._execute_real_buy_spot_short_perp(opp)
+        return await self._execute_real_buy_spot_short_perp(opp)
 
     async def _execute_real_buy_spot_short_perp(self, opp: ArbitrageOpportunity) -> bool:
-        try:
-            spot_conn_id = self.metascalp_connections[opp.spot_exchange]['spot_id']
-            perp_conn_id = self.metascalp_connections[opp.perp_exchange]['perp_id']
-
-            clean_symbol = opp.symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
-
-            spot_size = self.base_order_amount / opp.spot_price if opp.spot_price > 0 else self.base_order_amount / 100
-            perp_size = self.base_order_amount / opp.perp_price if opp.perp_price > 0 else self.base_order_amount / 100
-
-            spot_payload = {"Ticker": clean_symbol, "Side": 1, "Type": 4, "Size": spot_size, "ReduceOnly": False}
-            perp_payload = {"Ticker": clean_symbol, "Side": 2, "Type": 4, "Size": perp_size, "ReduceOnly": False}
-
-            async with self.metascalp_session.post(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{spot_conn_id}/orders",
-                json=spot_payload
-            ) as spot_resp:
-                spot_result = await spot_resp.json()
-
-            async with self.metascalp_session.post(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{perp_conn_id}/orders",
-                json=perp_payload
-            ) as perp_resp:
-                perp_result = await perp_resp.json()
-
-            if spot_result.get('Status') == 'ok' and perp_result.get('Status') == 'ok':
-                pos = Position(
-                    symbol=opp.symbol,
-                    spot_exchange=opp.spot_exchange,
-                    perp_exchange=opp.perp_exchange,
-                    direction='BUY_SPOT_SHORT_PERP',
-                    entry_time=self.current_timestamp,
-                    entry_funding_rate=opp.funding_rate,
-                    size_usdt=self.base_order_amount,
-                    spot_order_id=spot_result.get('ClientId'),
-                    perp_order_id=perp_result.get('ClientId'),
-                    spot_filled=False,
-                    perp_filled=False,
-                    next_funding_time=opp.next_funding_time,
-                    leverage=self.leverage
-                )
-                self.positions.append(pos)
-                self._save_open_positions()
-                self._last_current_rates[opp.symbol] = opp.funding_rate
-                self.last_strategy_action = StrategyAction.BUY_SPOT_SHORT_PERP
-                self.logger.info(f"✅ Ордера отправлены в MetaScalp (всего открыто: {len(self.active_positions)})")
-                return True
-            else:
-                self.logger.error(f"❌ Ошибка отправки ордеров")
-                return False
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка исполнения: {e}")
+        sym_key = f"{opp.symbol}|{opp.spot_exchange}|{opp.perp_exchange}"
+        if sym_key in self._opening_symbols:
+            self.logger.warning(f"⚠️ {opp.symbol} уже в процессе открытия, пропускаем")
             return False
+        self._opening_symbols.add(sym_key)
+        
+        try:
+            sc = self.metascalp_connections[opp.spot_exchange]['spot_id']
+            pc = self.metascalp_connections[opp.perp_exchange]['perp_id']
+            
+            cs_spot = self._format_ticker_for_exchange(opp.symbol, opp.spot_exchange)
+            cs_perp = self._format_ticker_for_exchange(opp.symbol, opp.perp_exchange)
+            
+            spot_price = opp.spot_price if opp.spot_price > 0 else 1.0
+            perp_price = opp.perp_price if opp.perp_price > 0 else 1.0
+            
+            # Размер фьючерса в токенах
+            ps = self.base_order_amount / perp_price
+            ps = self._round_size_for_exchange(ps, opp.perp_exchange, perp_price)
+            
+            # Размер спота в USDT (MetaScalp spot принимает Size в USDT!)
+            spot_size_usdt = ps * spot_price
+            ss_send = round(spot_size_usdt + spot_price, 2)  # +1 токен запаса
+            
+            for attempt in range(3):
+                self.logger.info(f"🔍 Попытка {attempt+1}: spot={cs_spot} size={ss_send} USDT, perp={cs_perp} size={ps}")
+                
+                # Шаг 1: Открываем фьючерс ПЕРВЫМ
+                async with self.metascalp_session.post(
+                    f"http://127.0.0.1:{self.metascalp_port}/api/connections/{pc}/orders",
+                    json={"Ticker": cs_perp, "Side": 2, "Type": 4, "Size": ps}
+                ) as pr:
+                    pres = await pr.json()
+                self.logger.info(f"🔍 Ответ perp: {pres}")
+                
+                perp_status = pres.get('Status') or pres.get('status', '')
+                if perp_status != 'ok':
+                    self.logger.warning(f"⚠️ Фьючерс не открылся: {pres}")
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Шаг 2: Фьючерс открыт — открываем спот (размер в USDT!)
+                async with self.metascalp_session.post(
+                    f"http://127.0.0.1:{self.metascalp_port}/api/connections/{sc}/orders",
+                    json={"Ticker": cs_spot, "Side": 1, "Type": 4, "Size": ss_send}
+                ) as sr:
+                    sres = await sr.json()
+                self.logger.info(f"🔍 Ответ spot: {sres}")
+                
+                spot_status = sres.get('Status') or sres.get('status', '')
+                if spot_status == 'ok':
+                    pos = Position(symbol=opp.symbol, spot_exchange=opp.spot_exchange, perp_exchange=opp.perp_exchange,
+                                direction='BUY_SPOT_SHORT_PERP', entry_time=self.current_timestamp,
+                                entry_funding_rate=opp.funding_rate, size_usdt=self.base_order_amount,
+                                spot_order_id=sres.get('ClientId') or sres.get('clientId'),
+                                perp_order_id=pres.get('ClientId') or pres.get('clientId'),
+                                next_funding_time=opp.next_funding_time, leverage=self.leverage,
+                                entry_perp_price=opp.perp_price)
+                    self.positions.append(pos)
+                    self._save_open_positions()
+                    self._last_current_rates[opp.symbol] = opp.funding_rate
+                    self._last_perp_prices[opp.symbol] = opp.perp_price
+                    self.logger.info(f"✅ Позиция открыта: spot={ss_send} USDT, perp={ps}")
+                    if self.tg_manager:
+                        await self.tg_manager.notify(
+                            f"📈 Открыта BUY: {opp.symbol} ({opp.spot_exchange}/{opp.perp_exchange})\n"
+                            f"Ставка: {opp.funding_rate*100:.4f}% | Прибыль: {opp.net_profit_bps:.1f} bps"
+                        )
+                    return True
+                
+                # Спот не открылся — откатываем фьючерс
+                self.logger.error(f"❌ Спот не открылся: {sres}, закрываем фьючерс")
+                async with self.metascalp_session.post(
+                    f"http://127.0.0.1:{self.metascalp_port}/api/connections/{pc}/orders",
+                    json={"Ticker": cs_perp, "Side": 1, "Type": 4, "Size": ps}
+                ) as cr:
+                    cres = await cr.json()
+                self.logger.info(f"🔧 Откат perp: {cres}")
+                
+                if self.tg_manager:
+                    await self.tg_manager.notify(f"❌ Откат {opp.symbol}: спот не открылся, фьючерс закрыт")
+                return False
+            
+            self.logger.error(f"❌ Не удалось открыть {opp.symbol} после 3 попыток")
+            if self.tg_manager:
+                await self.tg_manager.notify(f"❌ Не удалось открыть {opp.symbol} после 3 попыток")
+            return False
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка: {e}")
+            return False
+        finally:
+            self._opening_symbols.discard(sym_key)
 
     async def execute_sell_spot_long_perp(self, opp: ArbitrageOpportunity) -> bool:
-        self.logger.info(f"📉 SHORT SPOT + LONG PERP: {opp.symbol} (прибыль: {opp.net_profit_bps:.1f} bps)")
-
+        self.logger.info(f"📉 SHORT SPOT + LONG PERP: {opp.symbol} ({opp.net_profit_bps:.1f} bps)")
         if self.is_test_mode:
-            pos = Position(
-                symbol=opp.symbol,
-                spot_exchange=opp.spot_exchange,
-                perp_exchange=opp.perp_exchange,
-                direction='SELL_SPOT_LONG_PERP',
-                entry_time=self.current_timestamp,
-                entry_funding_rate=opp.funding_rate,
-                size_usdt=self.base_order_amount,
-                spot_filled=True,
-                perp_filled=True,
-                next_funding_time=opp.next_funding_time,
-                leverage=self.leverage
-            )
+            sfr = await self._get_trading_fees(opp.spot_exchange, opp.symbol, is_spot=True) or (self.manual_spot_fee_pct / 100.0)
+            pfr = await self._get_trading_fees(opp.perp_exchange, opp.symbol, is_spot=False) or (self.manual_futures_fee_pct / 100.0)
+            pos = Position(symbol=opp.symbol, spot_exchange=opp.spot_exchange, perp_exchange=opp.perp_exchange,
+                          direction='SELL_SPOT_LONG_PERP', entry_time=self.current_timestamp,
+                          entry_funding_rate=opp.funding_rate, size_usdt=self.base_order_amount,
+                          spot_filled=True, perp_filled=True, next_funding_time=opp.next_funding_time,
+                          leverage=self.leverage, entry_perp_price=opp.perp_price,
+                          spot_entry_fee=self.base_order_amount * sfr,
+                          perp_entry_fee=self.base_order_amount * pfr,
+                          spot_exit_fee=self.base_order_amount * sfr,
+                          perp_exit_fee=self.base_order_amount * pfr)
             self.positions.append(pos)
             self._save_open_positions()
             self._last_current_rates[opp.symbol] = opp.funding_rate
-            self.last_strategy_action = StrategyAction.SELL_SPOT_LONG_PERP
-            self.logger.info(f"🧪 [ТЕСТ] Позиция симулирована (всего открыто: {len(self.active_positions)})")
+            self._last_perp_prices[opp.symbol] = opp.perp_price
+            self.logger.info(f"🧪 [ТЕСТ] Позиция открыта (всего: {len(self.active_positions)})")
+            if self.tg_manager:
+                await self.tg_manager.notify(
+                    f"📉 Открыта SELL позиция: {pos.symbol} ({pos.spot_exchange}/{pos.perp_exchange})\n"
+                    f"Ставка: {pos.entry_funding_rate*100:.4f}% | Прибыль: {opp.net_profit_bps:.1f} bps"
+                )
             return True
-        else:
-            return await self._execute_real_sell_spot_long_perp(opp)
+        return await self._execute_real_sell_spot_long_perp(opp)
 
     async def _execute_real_sell_spot_long_perp(self, opp: ArbitrageOpportunity) -> bool:
-        try:
-            spot_conn_id = self.metascalp_connections[opp.spot_exchange]['spot_id']
-            perp_conn_id = self.metascalp_connections[opp.perp_exchange]['perp_id']
-
-            clean_symbol = opp.symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
-
-            spot_size = self.base_order_amount / opp.spot_price if opp.spot_price > 0 else self.base_order_amount / 100
-            perp_size = self.base_order_amount / opp.perp_price if opp.perp_price > 0 else self.base_order_amount / 100
-
-            spot_payload = {"Ticker": clean_symbol, "Side": 2, "Type": 4, "Size": spot_size, "ReduceOnly": False}
-            perp_payload = {"Ticker": clean_symbol, "Side": 1, "Type": 4, "Size": perp_size, "ReduceOnly": False}
-
-            async with self.metascalp_session.post(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{spot_conn_id}/orders",
-                json=spot_payload
-            ) as spot_resp:
-                spot_result = await spot_resp.json()
-
-            async with self.metascalp_session.post(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{perp_conn_id}/orders",
-                json=perp_payload
-            ) as perp_resp:
-                perp_result = await perp_resp.json()
-
-            if spot_result.get('Status') == 'ok' and perp_result.get('Status') == 'ok':
-                pos = Position(
-                    symbol=opp.symbol,
-                    spot_exchange=opp.spot_exchange,
-                    perp_exchange=opp.perp_exchange,
-                    direction='SELL_SPOT_LONG_PERP',
-                    entry_time=self.current_timestamp,
-                    entry_funding_rate=opp.funding_rate,
-                    size_usdt=self.base_order_amount,
-                    spot_order_id=spot_result.get('ClientId'),
-                    perp_order_id=perp_result.get('ClientId'),
-                    spot_filled=False,
-                    perp_filled=False,
-                    next_funding_time=opp.next_funding_time,
-                    leverage=self.leverage
-                )
-                self.positions.append(pos)
-                self._save_open_positions()
-                self._last_current_rates[opp.symbol] = opp.funding_rate
-                self.last_strategy_action = StrategyAction.SELL_SPOT_LONG_PERP
-                self.logger.info(f"✅ Ордера отправлены в MetaScalp (всего открыто: {len(self.active_positions)})")
-                return True
-            else:
-                self.logger.error(f"❌ Ошибка отправки ордеров")
-                return False
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка исполнения: {e}")
+        sym_key = f"{opp.symbol}|{opp.spot_exchange}|{opp.perp_exchange}"
+        if sym_key in self._opening_symbols:
+            self.logger.warning(f"⚠️ {opp.symbol} уже в процессе открытия, пропускаем")
             return False
+        self._opening_symbols.add(sym_key)
+        
+        try:
+            sc = self.metascalp_connections[opp.spot_exchange]['spot_id']
+            pc = self.metascalp_connections[opp.perp_exchange]['perp_id']
+            
+            cs_spot = self._format_ticker_for_exchange(opp.symbol, opp.spot_exchange)
+            cs_perp = self._format_ticker_for_exchange(opp.symbol, opp.perp_exchange)
+            
+            spot_price = opp.spot_price if opp.spot_price > 0 else 1.0
+            perp_price = opp.perp_price if opp.perp_price > 0 else 1.0
+            
+            # Размер фьючерса в токенах
+            ps = self.base_order_amount / perp_price
+            ps = self._round_size_for_exchange(ps, opp.perp_exchange, perp_price)
+            
+            # Размер спота в USDT (MetaScalp spot принимает Size в USDT!)
+            spot_size_usdt = ps * spot_price
+            ss_send = round(spot_size_usdt + spot_price, 2)  # +1 токен запаса
+            
+            for attempt in range(3):
+                self.logger.info(f"🔍 Попытка {attempt+1}: spot={cs_spot} size={ss_send} USDT, perp={cs_perp} size={ps}")
+                
+                # Шаг 1: Открываем фьючерс ПЕРВЫМ
+                async with self.metascalp_session.post(
+                    f"http://127.0.0.1:{self.metascalp_port}/api/connections/{pc}/orders",
+                    json={"Ticker": cs_perp, "Side": 1, "Type": 4, "Size": ps}
+                ) as pr:
+                    pres = await pr.json()
+                self.logger.info(f"🔍 Ответ perp: {pres}")
+                
+                perp_status = pres.get('Status') or pres.get('status', '')
+                if perp_status != 'ok':
+                    self.logger.warning(f"⚠️ Фьючерс не открылся: {pres}")
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Шаг 2: Фьючерс открыт — открываем спот (размер в USDT!)
+                async with self.metascalp_session.post(
+                    f"http://127.0.0.1:{self.metascalp_port}/api/connections/{sc}/orders",
+                    json={"Ticker": cs_spot, "Side": 2, "Type": 4, "Size": ss_send}
+                ) as sr:
+                    sres = await sr.json()
+                self.logger.info(f"🔍 Ответ spot: {sres}")
+                
+                spot_status = sres.get('Status') or sres.get('status', '')
+                if spot_status == 'ok':
+                    pos = Position(symbol=opp.symbol, spot_exchange=opp.spot_exchange, perp_exchange=opp.perp_exchange,
+                                direction='SELL_SPOT_LONG_PERP', entry_time=self.current_timestamp,
+                                entry_funding_rate=opp.funding_rate, size_usdt=self.base_order_amount,
+                                spot_order_id=sres.get('ClientId') or sres.get('clientId'),
+                                perp_order_id=pres.get('ClientId') or pres.get('clientId'),
+                                next_funding_time=opp.next_funding_time, leverage=self.leverage,
+                                entry_perp_price=opp.perp_price)
+                    self.positions.append(pos)
+                    self._save_open_positions()
+                    self._last_current_rates[opp.symbol] = opp.funding_rate
+                    self._last_perp_prices[opp.symbol] = opp.perp_price
+                    self.logger.info(f"✅ Позиция открыта: spot={ss_send} USDT, perp={ps}")
+                    if self.tg_manager:
+                        await self.tg_manager.notify(
+                            f"📉 Открыта SELL: {opp.symbol} ({opp.spot_exchange}/{opp.perp_exchange})\n"
+                            f"Ставка: {opp.funding_rate*100:.4f}% | Прибыль: {opp.net_profit_bps:.1f} bps"
+                        )
+                    return True
+                
+                # Спот не открылся — откатываем фьючерс
+                self.logger.error(f"❌ Спот не открылся: {sres}, закрываем фьючерс")
+                async with self.metascalp_session.post(
+                    f"http://127.0.0.1:{self.metascalp_port}/api/connections/{pc}/orders",
+                    json={"Ticker": cs_perp, "Side": 2, "Type": 4, "Size": ps}
+                ) as cr:
+                    cres = await cr.json()
+                self.logger.info(f"🔧 Откат perp: {cres}")
+                
+                if self.tg_manager:
+                    await self.tg_manager.notify(f"❌ Откат {opp.symbol}: спот не открылся, фьючерс закрыт")
+                return False
+            
+            self.logger.error(f"❌ Не удалось открыть {opp.symbol} после 3 попыток")
+            if self.tg_manager:
+                await self.tg_manager.notify(f"❌ Не удалось открыть {opp.symbol} после 3 попыток")
+            return False
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка: {e}")
+            return False
+        finally:
+            self._opening_symbols.discard(sym_key)
 
     async def execute_close_position(self, pos: Position, exit_reason: ExitReason = ExitReason.NORMAL) -> bool:
-        self.logger.info(f"🔒 Закрытие позиции: {pos.symbol}, причина: {exit_reason.value}")
+        if pos.close_time is not None:
+            self.logger.warning(f"⚠️ Позиция {pos.symbol} уже закрыта")
+            return False
+        if pos not in self.positions:
+            self.logger.warning(f"⚠️ Позиция {pos.symbol} не найдена")
+            return False
+        if pos.close_in_progress:
+            self.logger.warning(f"⚠️ Закрытие {pos.symbol} уже в процессе")
+            return False
+
+        pos.close_in_progress = True
+        self.logger.info(f"🔒 Закрытие: {pos.symbol}, причина: {exit_reason.russian()}")
 
         if self.is_test_mode:
-            simulated_pnl = await self._calculate_simulated_pnl(pos)
+            pnl = await self._calculate_simulated_pnl(pos)
             pos.close_time = self.current_timestamp
-            pos.pnl = simulated_pnl
+            pos.pnl = pnl
             pos.spot_filled = True
             pos.perp_filled = True
             pos.exit_reason = exit_reason.value
-
-            trade = TradeRecord(
-                id=datetime.now().strftime('%Y%m%d%H%M%S'),
-                symbol=pos.symbol,
-                direction=pos.direction,
-                entry_time=pos.entry_time,
-                exit_time=pos.close_time,
-                size_usdt=pos.size_usdt,
-                entry_funding_rate=pos.entry_funding_rate,
-                pnl=pos.pnl or 0,
-                pnl_pct=(pos.pnl or 0) / pos.size_usdt * 100 if pos.size_usdt else 0,
-                leverage=pos.leverage,
-                exit_reason=exit_reason.value,
-                spot_entry_fee=pos.spot_entry_fee,
-                perp_entry_fee=pos.perp_entry_fee,
-                spot_exit_fee=pos.spot_exit_fee,
-                perp_exit_fee=pos.perp_exit_fee
-            )
+            trade = TradeRecord(id=datetime.now().strftime('%Y%m%d%H%M%S'), symbol=pos.symbol, direction=pos.direction,
+                               entry_time=pos.entry_time, exit_time=pos.close_time, size_usdt=pos.size_usdt,
+                               entry_funding_rate=pos.entry_funding_rate, pnl=pnl,
+                               pnl_pct=pnl/pos.size_usdt*100 if pos.size_usdt else 0,
+                               leverage=pos.leverage, exit_reason=exit_reason.value,
+                               spot_entry_fee=pos.spot_entry_fee, perp_entry_fee=pos.perp_entry_fee,
+                               spot_exit_fee=pos.spot_exit_fee, perp_exit_fee=pos.perp_exit_fee)
             self._add_trade_record(trade)
-            
-            self.positions.remove(pos)
-            self._save_open_positions()
-
-            self.logger.info(f"🧪 [ТЕСТ] Позиция закрыта, PnL: {simulated_pnl:.4f} USDT")
+            if pos in self.positions:
+                self.positions.remove(pos)
+                self._save_open_positions()
+                self.logger.info(f"🧪 [ТЕСТ] Закрыта, PnL: {pnl:.4f} USDT")
+            if self.tg_manager:
+                await self.tg_manager.notify(
+                    f"🔒 Закрыта позиция: {pos.symbol}\n"
+                    f"PnL: {pnl:.4f} USDT | Причина: {exit_reason.russian()}"
+                )
             return True
         else:
             success = await self._execute_real_close_position(pos, exit_reason)
+            pos.close_in_progress = False
             if success:
-                real_pnl = await self._calculate_real_pnl(pos)
-                pos.pnl = real_pnl
-                self.positions.remove(pos)
-                self._save_open_positions()
-                self.logger.info(f"💰 Реальный PnL: {real_pnl:.4f} USDT")
+                if pos in self.positions:
+                    self.positions.remove(pos)
+                    self._save_open_positions()
             return success
 
     async def _execute_real_close_position(self, pos: Position, exit_reason: ExitReason) -> bool:
         try:
-            spot_conn_id = self.metascalp_connections[pos.spot_exchange]['spot_id']
-            perp_conn_id = self.metascalp_connections[pos.perp_exchange]['perp_id']
-
-            clean_symbol = pos.symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
+            sc = self.metascalp_connections[pos.spot_exchange]['spot_id']
+            pc = self.metascalp_connections[pos.perp_exchange]['perp_id']
+            
+            cs_spot = self._format_ticker_for_exchange(pos.symbol, pos.spot_exchange)
+            cs_perp = self._format_ticker_for_exchange(pos.symbol, pos.perp_exchange)
 
             if pos.direction == 'BUY_SPOT_SHORT_PERP':
-                spot_side = 2
-                perp_side = 1
+                spot_side, perp_side = 2, 1  # Sell spot, Buy perp
             else:
-                spot_side = 1
-                perp_side = 2
+                spot_side, perp_side = 1, 2  # Buy spot, Sell perp
 
-            spot_size = pos.size_usdt / 100
-            perp_size = pos.size_usdt / 100
+            # Размер фьючерса в токенах (как был при открытии)
+            perp_size = self.base_order_amount / (self._last_perp_prices.get(pos.symbol, 1.0) or 1.0)
+            perp_size = self._round_size_for_exchange(perp_size, pos.perp_exchange, 1.0)
+            
+            # Размер спота в USDT (MetaScalp spot принимает Size в USDT!)
+            spot_price = self._last_perp_prices.get(pos.symbol, 1.0) or 1.0
+            spot_size_usdt = perp_size * spot_price
+            spot_size = round(spot_size_usdt, 2)
 
-            spot_payload = {"Ticker": clean_symbol, "Side": spot_side, "Type": 4, "Size": spot_size, "ReduceOnly": True}
-            perp_payload = {"Ticker": clean_symbol, "Side": perp_side, "Type": 4, "Size": perp_size, "ReduceOnly": True}
+            async def send_close_order(conn_id, ticker, side, size, is_spot=False):
+                payload = {"Ticker": ticker, "Side": side, "Type": 4, "Size": size, "ReduceOnly": True}
+                async with self.metascalp_session.post(
+                    f"http://127.0.0.1:{self.metascalp_port}/api/connections/{conn_id}/orders",
+                    json=payload
+                ) as resp:
+                    result = await resp.json()
+                self.logger.info(f"🔍 Закрытие {ticker}: {result}")
+                return result
 
-            async with self.metascalp_session.post(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{spot_conn_id}/orders",
-                json=spot_payload
-            ) as spot_resp:
-                spot_result = await spot_resp.json()
-
-            async with self.metascalp_session.post(
-                f"http://127.0.0.1:{self.metascalp_port}/api/connections/{perp_conn_id}/orders",
-                json=perp_payload
-            ) as perp_resp:
-                perp_result = await perp_resp.json()
-
-            if spot_result.get('Status') == 'ok' and perp_result.get('Status') == 'ok':
-                pos.close_time = self.current_timestamp
-                pos.exit_reason = exit_reason.value
-                pos.spot_filled = False
-                pos.perp_filled = False
-                self.logger.info(f"✅ Ордера на закрытие отправлены")
-                return True
-            else:
-                self.logger.error(f"❌ Ошибка закрытия")
-                return False
+            for attempt in range(4):
+                self.logger.info(f"🔍 Попытка закрытия {attempt+1}: spot={cs_spot} size={spot_size} USDT, perp={cs_perp} size={perp_size}")
+                
+                spot_result, perp_result = await asyncio.gather(
+                    send_close_order(sc, cs_spot, spot_side, spot_size),
+                    send_close_order(pc, cs_perp, perp_side, perp_size)
+                )
+                
+                spot_status = spot_result.get('Status') or spot_result.get('status', '')
+                perp_status = perp_result.get('Status') or perp_result.get('status', '')
+                
+                if spot_status == 'ok' and perp_status == 'ok':
+                    pos.close_time = self.current_timestamp
+                    pos.exit_reason = exit_reason.value
+                    self.logger.info(f"✅ Позиция закрыта")
+                    if self.tg_manager:
+                        await self.tg_manager.notify(
+                            f"🔒 Закрыта: {pos.symbol}\nПричина: {exit_reason.russian()}"
+                        )
+                    return True
+                
+                self.logger.warning(f"⚠️ Попытка {attempt+1}: spot={spot_status}, perp={perp_status}")
+                await asyncio.sleep(2)
+            
+            self.logger.error(f"❌ Не удалось закрыть {pos.symbol} после 4 попыток")
+            if self.tg_manager:
+                await self.tg_manager.notify(
+                    f"🚨 Не удалось закрыть {pos.symbol} после 4 попыток!\nТребуется ручное вмешательство!"
+                )
+            return False
         except Exception as e:
             self.logger.error(f"❌ Ошибка закрытия: {e}")
+            if self.tg_manager:
+                await self.tg_manager.notify(f"❌ Ошибка при закрытии {pos.symbol}: {e}")
             return False
 
     # ========================================================================
-    # Основной цикл (ОПТИМИЗИРОВАН)
+    # Основной цикл
     # ========================================================================
 
     async def on_tick(self, opportunities: List[ArbitrageOpportunity]) -> None:
-        # Обновляем ставки для ВСЕХ активных позиций
         for pos in self.active_positions:
             result = await self._fetch_funding_rate(pos.perp_exchange, pos.symbol)
             if result:
-                current_rate, _ = result
-                self._last_current_rates[pos.symbol] = current_rate
-                self.logger.info(f"📊 on_tick: обновлена ставка для {pos.symbol}: {current_rate*100:.4f}%")
-            else:
-                self.logger.warning(f"❌ on_tick: не удалось получить ставку для {pos.symbol}")
-        
-        # Проверяем условия закрытия
+                rate, next_time = result
+                self._last_current_rates[pos.symbol] = rate
+                self.logger.info(f"📊 Ставка {pos.symbol}: {rate*100:.4f}%")
+                if pos.next_funding_time and self.current_timestamp >= pos.next_funding_time:
+                    if pos.last_funding_time is None or pos.next_funding_time > pos.last_funding_time:
+                        current_rate = self._last_current_rates.get(pos.symbol, pos.entry_funding_rate)
+                        funding_amount = abs(current_rate) * pos.size_usdt
+                        pos.funding_payments_received += funding_amount
+                        pos.funding_payments_count += 1
+                        pos.last_funding_time = pos.next_funding_time
+                        self.logger.info(f"💰 Выплата #{pos.funding_payments_count} для {pos.symbol}: {funding_amount:.4f} USDT (ставка {current_rate*100:.4f}%)")
+                        self._save_open_positions()
+                if next_time and (not pos.next_funding_time or next_time > pos.next_funding_time):
+                    pos.next_funding_time = next_time
+            ticker = await self._fetch_perp_price(pos.perp_exchange, pos.symbol)
+            if ticker:
+                self._last_perp_prices[pos.symbol] = ticker
+
         for pos in self.active_positions[:]:
-            current_rate = self._last_current_rates.get(pos.symbol)
-            self.logger.info(f"🔍 Проверка закрытия для {pos.symbol}: current_rate={current_rate}, entry_rate={pos.entry_funding_rate}")
-            if current_rate is not None:
-                should_close, reason = await self._check_close_condition(pos, current_rate)
+            if pos.close_in_progress:
+                continue
+            cr = self._last_current_rates.get(pos.symbol)
+            if cr is not None:
+                should_close, reason = await self._check_close_condition(pos, cr)
                 if should_close:
-                    self.logger.info(f"🚨 Закрываем {pos.symbol}, причина: {reason}")
                     await self.execute_close_position(pos, reason or ExitReason.NORMAL)
-            else:
-                self.logger.warning(f"⚠️ Нет актуальной ставки для {pos.symbol}, пропускаем проверку закрытия")
 
-        # Если достигнут лимит — не открываем новые
-        if not self.can_open_new_position():
+        if not self.trading_enabled:
             return
-
         if self.current_timestamp < self.next_arbitrage_opening_ts:
             return
 
-        # Ищем лучшую возможность, которая ещё не открыта
         for opp in opportunities:
-            if not self.can_open_new_position():
-                break
-
+            sym_key = f"{opp.symbol}|{opp.spot_exchange}|{opp.perp_exchange}"
+            if sym_key in self._opening_symbols:
+                continue  # уже пытаемся открыть
             if self.is_position_already_open(opp.symbol, opp.spot_exchange, opp.perp_exchange):
                 continue
+            if self.should_buy_spot_short_perp(opp) and self.can_open_long_position() and await self.can_buy_spot_short_perp(opp):
+                await self.execute_buy_spot_short_perp(opp)
+            elif self.should_sell_spot_long_perp(opp) and self.can_open_short_position() and await self.can_sell_spot_long_perp(opp):
+                await self.execute_sell_spot_long_perp(opp)
 
-            if self.should_buy_spot_short_perp(opp):
-                if await self.can_buy_spot_short_perp(opp):
-                    await self.execute_buy_spot_short_perp(opp)
-            elif self.should_sell_spot_long_perp(opp):
-                if await self.can_sell_spot_long_perp(opp):
-                    await self.execute_sell_spot_long_perp(opp)
+    async def _fetch_perp_price(self, exchange_name: str, symbol: str) -> Optional[float]:
+        exchange = self.exchanges.get(exchange_name)
+        if not exchange:
+            return None
+        try:
+            ticker = await exchange.fetch_ticker(symbol)
+            return ticker.get('last', 0)
+        except:
+            return None
 
     async def _scan_iteration(self) -> None:
         self.scan_count += 1
-
         if self.scan_count % 10 == 0:
             await self._check_exchanges_online()
-
         if self.scan_count % 720 == 0:
             self.filtered_by_volume = 0
             self.filtered_by_spread = 0
@@ -1807,40 +1931,41 @@ class FundingArbitrageBot:
             self.filtered_by_time = 0
             self.filtered_by_status = 0
             self.filtered_by_fees = 0
-
+            self.filtered_by_rate_threshold = 0
+            self.filtered_by_symbol_mismatch = 0
         await self._check_metascalp_connection()
 
-        whitelist = self._load_whitelist()
-        if not whitelist:
-            whitelist = await self._get_fallback_symbols()
-        else:
-            self.whitelist = whitelist
+        now = time.time()
+        cache_age = (now - self.cache_last_updated) / 60 if self.cache_last_updated > 0 else 999
+        if cache_age >= self.cache_rebuild_interval or not self.instrument_cache:
+            await self._rebuild_instrument_cache()
+
+        self.filtered_by_volume = 0
+        self.filtered_by_spread = 0
+        self.filtered_by_margin = 0
+        self.filtered_by_time = 0
+        self.filtered_by_fees = 0
+        self.filtered_by_rate_threshold = 0
+        self.filtered_by_symbol_mismatch = 0
 
         self.last_scan_time = self.current_timestamp
-
-        opportunities = []
-        if whitelist:
-            opportunities = await self._scan_all_opportunities(whitelist)
-            opportunities.sort(key=lambda x: x.net_profit_bps, reverse=True)
-
-            self.current_opportunities = opportunities[:self.max_current_opportunities]
-
-            for opp in opportunities[:self.max_recent_opportunities]:
-                self.recent_opportunities.append(opp)
-
-            if opportunities:
-                self.opportunities_found += len(opportunities)
-
-                for i, opp in enumerate(opportunities[:5]):
+        opportunities = await self._scan_cached_opportunities()
+        opportunities.sort(key=lambda x: x.net_profit_bps, reverse=True)
+        self.current_opportunities = opportunities[:self.max_current_opportunities]
+        for opp in opportunities[:self.max_recent_opportunities]:
+            self.recent_opportunities.append(opp)
+        if opportunities:
+            self.opportunities_found += len(opportunities)
+            current_signal_keys = set()
+            for i, opp in enumerate(opportunities[:5]):
+                key = f"{opp.symbol}|{opp.spot_exchange}|{opp.perp_exchange}"
+                current_signal_keys.add(key)
+                if key not in self._last_signal_log_set:
                     self.signal_logger.info(
                         f"#{i+1} | {opp.symbol} | {opp.spot_exchange}/{opp.perp_exchange} | "
-                        f"Ставка: {opp.funding_rate*100:.4f}% | Прибыль: {opp.net_profit_bps:.1f} bps | "
-                        f"Объём: {opp.volume_24h_usdt:,.0f} USDT | Направление: {opp.direction}"
+                        f"Ставка: {opp.funding_rate*100:.4f}% | Прибыль: {opp.net_profit_bps:.1f} bps"
                     )
-        else:
-            self.current_opportunities = []
-
-        # ВАЖНО: ВСЕГДА вызываем on_tick, даже если нет новых сигналов!
+            self._last_signal_log_set = current_signal_keys
         await self.on_tick(opportunities)
 
     async def scan_loop(self) -> None:
@@ -1848,18 +1973,176 @@ class FundingArbitrageBot:
             try:
                 await self._scan_iteration()
             except Exception as e:
-                self.logger.error(f"❌ Ошибка в цикле: {e}", exc_info=True)
-
+                self.logger.error(f"❌ Ошибка цикла: {e}", exc_info=True)
             await asyncio.sleep(self.scan_interval)
 
-    async def run(self) -> None:
-        await self.initialize()
-        self.scan_task = asyncio.create_task(self.scan_loop())
-        self.logger.info(f"🚀 Бот запущен, интервал сканирования: {self.scan_interval} сек")
+    # ========================================================================
+    # Конфигурация через дашборд
+    # ========================================================================
+
+    def update_config(self, updates: Dict[str, Any]) -> None:
+        old_min_profit = self.config.get('min_profit_bps', 10)
+        old_check = self.config.get('check_trading_status', True)
+        old_active = set(self.config.get('active_exchanges', []))
+        old_deduct = self.config.get('deduct_fees_from_profit', True)
+
+        for key, value in updates.items():
+            if key in self.config:
+                old_val = self.config[key]
+                self.config[key] = value
+                if old_val != value:
+                    self.logger.info(f"📝 Конфиг обновлён: {key} = {value}")
+
+        self.scan_interval = self.config.get('scan_interval', 5)
+        self.base_order_amount = self.config.get('base_order_amount', 100.0)
+        self.min_profit_bps = self.config.get('min_profit_bps', 10)
+        self.manual_test_mode = self.config.get('test_mode', True)
+        self.leverage = self.config.get('leverage', 3)
+        self.margin_enabled = self.config.get('margin_enabled', False)
+        self.min_volume_24h_usdt = self.config.get('min_volume_24h_usdt', 10000)
+        self.max_slippage_pct = self.config.get('max_slippage_pct', 1.0)
+        self.min_time_to_funding_minutes = self.config.get('min_time_to_funding_minutes', 0)
+        self.check_trading_status = self.config.get('check_trading_status', True)
+        self.deduct_fees_from_profit = self.config.get('deduct_fees_from_profit', True)
+        self.manual_spot_fee_pct = self.config.get('manual_spot_fee_pct', 0.1)
+        self.manual_futures_fee_pct = self.config.get('manual_futures_fee_pct', 0.05)
+        self.max_positions_per_side = self.config.get('max_positions_per_side', 5)
+        self.max_position_age_hours = self.config.get('max_position_age_hours', 24)
+        self.post_funding_close_delay = self.config.get('post_funding_close_delay_minutes', 5)
+        self.max_concurrent_requests = self.config.get('max_concurrent_requests', 20)
+        self.max_concurrent_cache_requests = self.config.get('max_concurrent_cache_requests', 30)
+        self.cache_rebuild_interval = self.config.get('cache_rebuild_interval_minutes', 30)
+        self.normalize_symbols = self.config.get('normalize_symbols', True)
+        self.cache_max_instruments = self.config.get('cache_max_instruments', 500)
+        self.trading_enabled = self.config.get('trading_enabled', True)
+        self.max_price_change_pct = self.config.get('max_price_change_pct', 15)
+
+        if old_deduct and not self.deduct_fees_from_profit:
+            self.spot_fees_cache.clear()
+            self.futures_fees_cache.clear()
+
+        new_min_profit = self.config.get('min_profit_bps', 10)
+        new_check = self.config.get('check_trading_status', True)
+        new_active = set(self.config.get('active_exchanges', []))
+        if old_min_profit != new_min_profit or old_check != new_check or old_active != new_active:
+            self.instrument_cache.clear()
+            self.cache_last_updated = 0
+            self.logger.info("🔄 Кэш сброшен из-за изменения критичных фильтров")
+
+        self._save_config()
+
+    def update_active_exchanges(self, exchanges: List[str]) -> None:
+        valid = [e for e in exchanges if e in self.config['enabled_exchanges']]
+        self.config['active_exchanges'] = valid
+        self.instrument_cache.clear()
+        self.cache_last_updated = 0
+        self._save_config()
+        self.logger.info(f"📝 Активные биржи обновлены: {', '.join(valid)}")
+
+    def get_status(self) -> dict:
+        active_positions = self.active_positions
+        fp = active_positions[0] if active_positions else None
+        positions_with_id = []
+        for p in active_positions:
+            pd = asdict(p)
+            pd['position_id'] = f"{p.symbol}_{p.spot_exchange}_{p.perp_exchange}_{p.entry_time}"
+            pd['estimated_pnl'] = self.get_position_estimated_pnl(p)
+            if p.next_funding_time:
+                ttf = p.next_funding_time - self.current_timestamp
+                pd['funding_time_str'] = f"{int(ttf//3600)}ч {int((ttf%3600)//60)}м" if ttf > 0 else "выплата идёт"
+            else:
+                pd['funding_time_str'] = "—"
+            positions_with_id.append(pd)
+
+        next_funding_str = positions_with_id[0]['funding_time_str'] if positions_with_id else None
+        current_rates = {pos.symbol: self._last_current_rates.get(pos.symbol) for pos in active_positions if self._last_current_rates.get(pos.symbol) is not None}
+
+        long_count = sum(1 for p in active_positions if p.direction == 'BUY_SPOT_SHORT_PERP')
+        short_count = sum(1 for p in active_positions if p.direction == 'SELL_SPOT_LONG_PERP')
+        next_update_in = max(0, int(self.cache_rebuild_interval * 60 - (time.time() - self.cache_last_updated))) if self.cache_last_updated > 0 else 0
+        uptime_seconds = int(self.current_timestamp - self.start_time)
+
+        return {
+            'version': __version__,
+            'bot_name': BOT_NAME,
+            'timestamp': self.current_timestamp,
+            'datetime': datetime.now().isoformat(),
+            'uptime_seconds': uptime_seconds,
+            'strategy_state': self.strategy_state.value,
+            'connection_state': self.metascalp_state.value,
+            'exchange_status': self.exchange_status,
+            'test_mode': self.is_test_mode,
+            'auto_test_mode': self.auto_test_mode,
+            'trading_enabled': self.trading_enabled,
+            'metascalp_port': self.metascalp_port,
+            'metascalp_version': self.metascalp_version,
+            'metascalp_connections': self.metascalp_connections,
+            'metascalp_balances': self.metascalp_balances,
+            'positions': positions_with_id,
+            'position': asdict(fp) if fp else None,
+            'active_positions_count': len(active_positions),
+            'long_positions_count': long_count,
+            'short_positions_count': short_count,
+            'current_funding_rate': current_rates.get(fp.symbol) if fp else None,
+            'current_funding_rates': current_rates,
+            'next_funding_time_str': next_funding_str,
+            'scan_count': self.scan_count,
+            'opportunities_found': self.opportunities_found,
+            'total_pnl': self.total_pnl,
+            'trades_count': len(self.trades_history),
+            'current_opportunities': [o.to_dict() for o in self.current_opportunities],
+            'recent_opportunities': [o.to_dict() for o in self.recent_opportunities],
+            'last_scan_time': self.last_scan_time,
+            'cache_info': {
+                'total_futures_found': self.cache_total_futures_found,
+                'filtered_by_profit': self.cache_filtered_by_profit,
+                'filtered_by_no_spot': self.cache_filtered_by_no_spot,
+                'filtered_by_status': self.cache_filtered_by_status,
+                'instruments_in_cache': len(self.instrument_cache),
+                'last_updated': self.cache_last_updated,
+                'next_update_in_seconds': next_update_in,
+            },
+            'level1_stats': {
+                'checked': len(self.instrument_cache),
+                'signals_found': len(self.current_opportunities),
+                'filtered_by_volume': self.filtered_by_volume,
+                'filtered_by_spread': self.filtered_by_spread,
+                'filtered_by_margin': self.filtered_by_margin,
+                'filtered_by_time': self.filtered_by_time,
+                'filtered_by_rate_threshold': self.filtered_by_rate_threshold,
+                'filtered_by_fees': self.filtered_by_fees,
+                'filtered_by_symbol_mismatch': self.filtered_by_symbol_mismatch,
+            },
+            'config': {
+                'enabled_exchanges': self.config.get('enabled_exchanges', []),
+                'active_exchanges': self.config.get('active_exchanges', []),
+                'scan_interval': self.scan_interval,
+                'base_order_amount': self.base_order_amount,
+                'min_profit_bps': self.min_profit_bps,
+                'test_mode': self.manual_test_mode,
+                'leverage': self.leverage,
+                'margin_enabled': self.margin_enabled,
+                'min_volume_24h_usdt': self.min_volume_24h_usdt,
+                'max_slippage_pct': self.max_slippage_pct,
+                'min_time_to_funding_minutes': self.min_time_to_funding_minutes,
+                'check_trading_status': self.check_trading_status,
+                'deduct_fees_from_profit': self.deduct_fees_from_profit,
+                'manual_spot_fee_pct': self.manual_spot_fee_pct,
+                'manual_futures_fee_pct': self.manual_futures_fee_pct,
+                'max_positions_per_side': self.max_positions_per_side,
+                'max_position_age_hours': self.max_position_age_hours,
+                'post_funding_close_delay_minutes': self.config.get('post_funding_close_delay_minutes', 5),
+                'cache_rebuild_interval_minutes': self.cache_rebuild_interval,
+                'normalize_symbols': self.normalize_symbols,
+                'trading_enabled': self.trading_enabled,
+                'max_price_change_pct': self.max_price_change_pct,
+            },
+            'trades_history': [t.to_dict() for t in self.trades_history[-10:]]
+        }
 
 
 # ============================================================================
-# FastAPI приложение с lifespan
+# FastAPI
 # ============================================================================
 
 @asynccontextmanager
@@ -1879,90 +2162,60 @@ bot: Optional[FundingArbitrageBot] = None
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    dashboard_path = Path(__file__).parent / "dashboard.html"
-    if dashboard_path.exists():
-        return dashboard_path.read_text(encoding='utf-8')
-    return "<h1>Dashboard not found</h1>"
-
+    dp = Path(__file__).parent / "dashboard.html"
+    return dp.read_text(encoding='utf-8') if dp.exists() else "<h1>Dashboard not found</h1>"
 
 @app.get("/api/status")
 async def get_status():
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not ready")
+    if not bot: raise HTTPException(503, "Bot not ready")
     return bot.get_status()
-
 
 @app.post("/api/config")
 async def update_config(updates: Dict[str, Any]):
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not ready")
+    if not bot: raise HTTPException(503, "Bot not ready")
     bot.update_config(updates)
-    return {"status": "ok", "updated": updates}
-
+    return {"status": "ok"}
 
 @app.post("/api/exchanges")
 async def update_active_exchanges(data: Dict[str, List[str]]):
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not ready")
-    exchanges = data.get('exchanges', [])
-    bot.update_active_exchanges(exchanges)
-    return {"status": "ok", "active_exchanges": exchanges}
-
+    if not bot: raise HTTPException(503, "Bot not ready")
+    bot.update_active_exchanges(data.get('exchanges', []))
+    return {"status": "ok"}
 
 @app.get("/api/opportunities")
 async def get_opportunities():
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not ready")
+    if not bot: raise HTTPException(503, "Bot not ready")
     return [o.to_dict() for o in bot.current_opportunities[:20]]
-
 
 @app.get("/api/trades")
 async def get_trades():
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not ready")
+    if not bot: raise HTTPException(503, "Bot not ready")
     return [t.to_dict() for t in bot.trades_history]
-
 
 @app.post("/api/force_scan")
 async def force_scan():
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not ready")
+    if not bot: raise HTTPException(503, "Bot not ready")
     await bot._scan_iteration()
     return {"status": "ok"}
 
-
 @app.post("/api/positions/close")
 async def close_position_manually(data: Dict[str, str]):
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not ready")
-    
-    position_id = data.get('position_id')
-    if not position_id:
-        raise HTTPException(status_code=400, detail="position_id is required")
-    
-    pos = bot.find_position_by_id(position_id)
-    if not pos:
-        raise HTTPException(status_code=404, detail="Position not found")
-    
+    if not bot: raise HTTPException(503, "Bot not ready")
+    pid = data.get('position_id')
+    if not pid: raise HTTPException(400, "position_id required")
+    pos = bot.find_position_by_id(pid)
+    if not pos: raise HTTPException(404, "Position not found")
     asyncio.create_task(bot.execute_close_position(pos, ExitReason.MANUAL))
-    
-    return {"status": "ok", "message": f"Position {pos.symbol} closing initiated"}
+    return {"status": "ok"}
 
-
-# ============================================================================
-# Точка входа
-# ============================================================================
 
 def main():
     config = yaml.safe_load(Path("config.yaml").read_text())
     port = config.get('dashboard_port', 8000)
     host = config.get('dashboard_host', '127.0.0.1')
-
     print(f"🤖 {BOT_NAME} v{__version__}")
-    print(f"📊 Дашборд доступен по адресу: http://{host}:{port}")
-
+    print(f"📊 Дашборд: http://{host}:{port}")
     uvicorn.run(app, host=host, port=port)
-
 
 if __name__ == "__main__":
     main()
